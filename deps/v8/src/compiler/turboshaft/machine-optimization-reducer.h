@@ -2028,6 +2028,11 @@ class MachineOptimizationReducer : public Next {
           if (broker != nullptr) {
             UnparkedScopeIfNeeded scope(broker);
             AllowHandleDereference allow_handle_dereference;
+            // We don't expect holes to get here normally, but they might
+            // via some un-eliminated dead code.
+            if (IsAnyHole(*base.handle())) {
+              return __ RuntimeAbort(AbortReason::kUnreachable);
+            }
             OptionalMapRef map = TryMakeRef(broker, base.handle()->map());
             if (MapLoadCanBeConstantFolded(map)) {
               return __ HeapConstant(map->object());
@@ -2295,7 +2300,11 @@ class MachineOptimizationReducer : public Next {
                 matcher_.MatchHeapConstant(left, &o1) &&
                 matcher_.MatchHeapConstant(right, &o2)) {
               UnparkedScopeIfNeeded unparked(broker);
-              if (IsString(*o1) && IsString(*o2)) {
+              // We might see holes as a constant, if there are any hole checks.
+              // These have to be checked for explicitly, because of hole
+              // unmapping.
+              if (!IsAnyHole(*o1) && !IsAnyHole(*o2) && IsString(*o1) &&
+                  IsString(*o2)) {
                 // If handles refer to the same object, we can eliminate the
                 // check.
                 if (o1.address() == o2.address()) return __ Word32Constant(1);

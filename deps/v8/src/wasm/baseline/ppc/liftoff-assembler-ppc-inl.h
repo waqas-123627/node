@@ -506,7 +506,15 @@ void LiftoffAssembler::StoreTaggedPointer(Register dst_addr,
   if (protected_store_pc) *protected_store_pc = pc_offset();
   StoreTaggedField(src, dst_op, r0);
 
-  if (skip_write_barrier || v8_flags.disable_write_barriers) return;
+  if (v8_flags.disable_write_barriers) return;
+
+  if (skip_write_barrier) {
+    if (v8_flags.verify_write_barriers) {
+      CallVerifySkippedWriteBarrierStubSaveRegisters(dst_addr, src,
+                                                     SaveFPRegsMode::kSave);
+    }
+    return;
+  }
 
   Label exit;
   JumpIfSmi(src, &exit);
@@ -2861,7 +2869,7 @@ void LiftoffAssembler::emit_v128_anytrue(LiftoffRegister dst,
 
 void LiftoffAssembler::emit_i8x16_bitmask(LiftoffRegister dst,
                                           LiftoffRegister src) {
-  I8x16BitMask(dst.gp(), src.fp().toSimd(), r0, ip, kScratchSimd128Reg);
+  I8x16BitMask(dst.gp(), src.fp().toSimd(), ip, r0, kScratchSimd128Reg);
 }
 
 void LiftoffAssembler::emit_s128_const(LiftoffRegister dst,
@@ -3113,47 +3121,6 @@ void LiftoffAssembler::DeallocateStackSlot(uint32_t size) {
 }
 
 void LiftoffAssembler::MaybeOSR() {}
-
-void LiftoffAssembler::emit_store_nonzero_if_nan(Register dst,
-                                                 DoubleRegister src,
-                                                 ValueKind kind) {
-  Label return_nan, done;
-  fcmpu(src, src);
-  bunordered(&return_nan);
-  b(&done);
-  bind(&return_nan);
-  StoreF32(src, MemOperand(dst), r0);
-  bind(&done);
-}
-
-void LiftoffAssembler::emit_s128_store_nonzero_if_nan(Register dst,
-                                                      LiftoffRegister src,
-                                                      Register tmp_gp,
-                                                      LiftoffRegister tmp_s128,
-                                                      ValueKind lane_kind) {
-  Label done;
-  if (lane_kind == kF32) {
-    xvcmpeqsp(tmp_s128.fp().toSimd(), src.fp().toSimd(), src.fp().toSimd(),
-              SetRC);
-  } else {
-    DCHECK_EQ(lane_kind, kF64);
-    xvcmpeqdp(tmp_s128.fp().toSimd(), src.fp().toSimd(), src.fp().toSimd(),
-              SetRC);
-  }
-  // CR_LT which is targeting cr6 bit 0, indicating if all lanes true (no lanes
-  // are NaN).
-  Condition all_lanes_true = lt;
-  b(all_lanes_true, &done, cr6);
-  // Do not use the src register as a Fp register to store a value.
-  // We use two different sets for Fp and Simd registers on PPC.
-  li(tmp_gp, Operand(1));
-  StoreU32(tmp_gp, MemOperand(dst), r0);
-  bind(&done);
-}
-
-void LiftoffAssembler::emit_store_nonzero(Register dst) {
-  StoreU32(dst, MemOperand(dst), r0);
-}
 
 void LiftoffStackSlots::Construct(int param_slots) {
   DCHECK_LT(0, slots_.size());

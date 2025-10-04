@@ -1250,6 +1250,15 @@ void InstructionSelector::InitializeCallBuffer(
       break;
     }
     case CallDescriptor::kCallJSFunction:
+      // TODO(olivf): Implement the required kArchCallJSFunction with
+      // immediate argument on all architectures.
+#if defined(V8_TARGET_ARCH_X64) || defined(V8_TARGET_ARCH_ARM) || \
+    defined(V8_TARGET_ARCH_ARM64)
+      if (this->IsHeapConstant(callee)) {
+        buffer->instruction_args.push_back(g.UseImmediate(callee));
+        break;
+      }
+#endif
       buffer->instruction_args.push_back(
           g.UseLocation(callee, buffer->descriptor->GetInputLocation(0)));
       break;
@@ -1522,6 +1531,17 @@ void InstructionSelector::VisitBlock(const Block* block) {
       // up".
       current_effect_level_ = GetEffectLevel(node);
       VisitNode(node);
+
+      // Nodes that don't produce a value won't be marked as Defined by
+      // VisitNode (simply because nodes are marked as defined when instruction
+      // selectors do something like `DefinedAsRegister(node)`, which isn't done
+      // for non-value nodes like Store). So, we mark every visitted nodes as
+      // Defined here, so that it's clear when processing the next nodes (which
+      // are earlier in the graph), that this use has already been processed
+      // (which is useful for instance when trying to cover inputs, like in
+      // `TryPrepareScheduleFirstProjection`).
+      MarkAsDefined(node);
+
       if (!FinishEmittedInstructions(node, current_node_end)) return;
     }
     if (trace_turbo_) {
@@ -2264,8 +2284,8 @@ void InstructionSelector::VisitCall(OpIndex node, Block* handler) {
       opcode = EncodeCallDescriptorFlags(kArchCallWasmFunctionIndirect, flags);
       break;
     case CallDescriptor::kResumeWasmContinuation:
-      opcode = EncodeCallDescriptorFlags(kArchResumeWasmContinuation, flags);
-      break;
+      // Should be called via Builtin::kWasmFXResume.
+      UNREACHABLE();
 #endif  // V8_ENABLE_WEBASSEMBLY
     case CallDescriptor::kCallBuiltinPointer:
       opcode = EncodeCallDescriptorFlags(kArchCallBuiltinPointer, flags);

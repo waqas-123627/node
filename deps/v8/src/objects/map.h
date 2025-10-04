@@ -108,7 +108,6 @@ enum InstanceType : uint16_t;
   IF_WASM(V, WasmMemoryObject)        \
   IF_WASM(V, WasmResumeData)          \
   IF_WASM(V, WasmStruct)              \
-  IF_WASM(V, WasmDescriptorOptions)   \
   IF_WASM(V, WasmSuspendingObject)    \
   IF_WASM(V, WasmContinuationObject)  \
   IF_WASM(V, WasmTableObject)         \
@@ -689,7 +688,6 @@ class Map : public TorqueGeneratedMap<Map, HeapObject> {
 
   // [instance descriptors]: describes the object.
   DECL_ACCESSORS(instance_descriptors, Tagged<DescriptorArray>)
-  DECL_RELAXED_ACCESSORS(instance_descriptors, Tagged<DescriptorArray>)
   DECL_ACQUIRE_GETTER(instance_descriptors, Tagged<DescriptorArray>)
   V8_EXPORT_PRIVATE void SetInstanceDescriptors(
       Isolate* isolate, Tagged<DescriptorArray> descriptors,

@@ -4,7 +4,6 @@
 
 #include "src/wasm/wasm-module.h"
 
-#include <functional>
 #include <memory>
 
 #include "src/api/api-inl.h"
@@ -723,9 +722,9 @@ int GetSourcePosition(const WasmModule* module, uint32_t func_index,
 size_t WasmModule::EstimateStoredSize() const {
   UPDATE_WHEN_CLASS_CHANGES(WasmModule,
 #if V8_ENABLE_DRUMBRAKE
-                            824
+                            904
 #else   // V8_ENABLE_DRUMBRAKE
-                            792
+                            872
 #endif  // V8_ENABLE_DRUMBRAKE
   );
   return sizeof(WasmModule) +                            // --
@@ -744,6 +743,8 @@ size_t WasmModule::EstimateStoredSize() const {
          ContentSize(elem_segments) +                    // --
          ContentSize(branch_hints) +                     // --
          ContentSize(compilation_priorities) +           // --
+         ContentSize(instruction_frequencies) +          // --
+         ContentSize(call_targets) +                     // --
          ContentSize(inst_traces) +                      // --
          (num_declared_functions + 7) / 8;               // validated_functions
 }
@@ -782,7 +783,7 @@ size_t IndirectNameMap::EstimateCurrentMemoryConsumption() const {
 
 size_t TypeFeedbackStorage::EstimateCurrentMemoryConsumption() const {
   UPDATE_WHEN_CLASS_CHANGES(TypeFeedbackStorage, 112);
-  UPDATE_WHEN_CLASS_CHANGES(FunctionTypeFeedback, 40);
+  UPDATE_WHEN_CLASS_CHANGES(FunctionTypeFeedback, 48);
   // Not including sizeof(TFS) because that's contained in sizeof(WasmModule).
   base::MutexGuard guard(&mutex);
   size_t result = ContentSize(feedback_for_function);
@@ -802,9 +803,9 @@ size_t TypeFeedbackStorage::EstimateCurrentMemoryConsumption() const {
 size_t WasmModule::EstimateCurrentMemoryConsumption() const {
   UPDATE_WHEN_CLASS_CHANGES(WasmModule,
 #if V8_ENABLE_DRUMBRAKE
-                            824
+                            904
 #else   // V8_ENABLE_DRUMBRAKE
-                            792
+                            872
 #endif  // V8_ENABLE_DRUMBRAKE
   );
   size_t result = EstimateStoredSize();
@@ -855,10 +856,19 @@ size_t GetWireBytesHash(base::Vector<const uint8_t> wire_bytes) {
 int NumFeedbackSlots(const WasmModule* module, int func_index) {
   base::MutexGuard mutex_guard{&module->type_feedback.mutex};
   auto it = module->type_feedback.feedback_for_function.find(func_index);
-  if (it == module->type_feedback.feedback_for_function.end()) return 0;
+  if (it == module->type_feedback.feedback_for_function.end()) {
+    // The first slot is reserved for total invocation count.
+    return FeedbackConstants::kHeaderSlots;
+  }
   // The number of call instructions is capped by max function size.
-  static_assert(kV8MaxWasmFunctionSize < std::numeric_limits<int>::max() / 2);
-  return static_cast<int>(2 * it->second.call_targets.size());
+  static_assert(kV8MaxWasmFunctionSize *
+                        FeedbackConstants::kSlotsPerInstruction +
+                    FeedbackConstants::kHeaderSlots <
+                static_cast<size_t>(std::numeric_limits<int>::max()));
+  // The first slot is reserved for total invocation count.
+  return static_cast<int>(FeedbackConstants::kSlotsPerInstruction *
+                              it->second.call_targets.size() +
+                          FeedbackConstants::kHeaderSlots);
 }
 
 }  // namespace v8::internal::wasm

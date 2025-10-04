@@ -304,7 +304,6 @@ void BodyDescriptorBase::IterateProtectedPointer(Tagged<HeapObject> obj,
   v->VisitProtectedPointer(host, host->RawProtectedPointerField(offset));
 }
 
-#ifdef V8_ENABLE_LEAPTIERING
 template <typename ObjectVisitor>
 void BodyDescriptorBase::IterateJSDispatchEntry(Tagged<HeapObject> obj,
                                                 int offset, ObjectVisitor* v) {
@@ -312,7 +311,6 @@ void BodyDescriptorBase::IterateJSDispatchEntry(Tagged<HeapObject> obj,
       obj->Relaxed_ReadField<JSDispatchHandle::underlying_type>(offset));
   v->VisitJSDispatchTableEntry(obj, handle);
 }
-#endif  // V8_ENABLE_LEAPTIERING
 
 class HeapNumber::BodyDescriptor final : public DataOnlyBodyDescriptor {
  public:
@@ -566,11 +564,7 @@ class AllocationSite::BodyDescriptor final : public BodyDescriptorBase {
 class JSFunction::BodyDescriptor final : public BodyDescriptorBase {
  public:
   static const int kStartOffset = JSObject::BodyDescriptor::kStartOffset;
-#ifdef V8_ENABLE_LEAPTIERING
   static const int kCodeFieldOffset = JSFunction::kDispatchHandleOffset;
-#else
-  static const int kCodeFieldOffset = JSFunction::kCodeOffset;
-#endif
 
   template <typename ObjectVisitor>
   static inline void IterateBody(Tagged<Map> map, Tagged<HeapObject> obj,
@@ -580,17 +574,7 @@ class JSFunction::BodyDescriptor final : public BodyDescriptorBase {
     DCHECK_GE(object_size, header_size);
     IteratePointers(obj, kStartOffset, kCodeFieldOffset, v);
 
-#ifdef V8_ENABLE_LEAPTIERING
     IterateJSDispatchEntry(obj, kDispatchHandleOffset, v);
-#else
-    // The code field is treated as a custom weak pointer. This field
-    // is visited as a weak pointer if the Code is baseline code
-    // and the bytecode array corresponding to this function is old. In the rest
-    // of the cases this field is treated as strong pointer.
-    // See MarkingVisitorBase::VisitJSFunction.
-    IterateCodePointer(obj, kCodeOffset, v, IndirectPointerMode::kCustom);
-    DCHECK_GE(header_size, kCodeOffset);
-#endif  // V8_ENABLE_LEAPTIERING
 
     // Iterate rest of the header fields
     IteratePointers(obj, kCodeFieldOffset + kTaggedSize, header_size, v);
@@ -714,8 +698,9 @@ class JSExternalObject::BodyDescriptor final : public BodyDescriptorBase {
                                  int object_size, ObjectVisitor* v) {
     DCHECK_EQ(0, map->GetInObjectProperties());
     IteratePointers(obj, kPropertiesOrHashOffset, kEndOfTaggedFieldsOffset, v);
-    v->VisitExternalPointer(obj, obj->RawExternalPointerField(
-                                     kValueOffset, kExternalObjectValueTag));
+    v->VisitExternalPointer(
+        obj, obj->RawExternalPointerField(
+                 kValueOffset, {kFirstExternalTypeTag, kLastExternalTypeTag}));
   }
 
   static inline int SizeOf(Tagged<Map> map, Tagged<HeapObject> object) {
@@ -1237,35 +1222,13 @@ class WasmStruct::BodyDescriptor final : public BodyDescriptorBase {
   }
 };
 
-// TODO(403372470): This is effectively the same as just dropping this
-// descriptor and falling back to the default JSObject::BodyDescriptor.
-// If WebAssembly.DescriptorOptions remains in the proposal, we could
-// simplify this code. (Or decide that having an explicit descriptor for
-// each class is good style.)
-class WasmDescriptorOptions::BodyDescriptor final : public BodyDescriptorBase {
- public:
-  template <typename ObjectVisitor>
-  static inline void IterateBody(Tagged<Map> map, Tagged<HeapObject> obj,
-                                 int object_size, ObjectVisitor* v) {
-    IteratePointers(obj, JSObject::BodyDescriptor::kStartOffset, kHeaderSize,
-                    v);
-    IterateJSObjectBodyImpl(map, obj, kHeaderSize, object_size, v);
-  }
-
-  static inline int SizeOf(Tagged<Map> map, Tagged<HeapObject> object) {
-    return map->instance_size();
-  }
-};
-
 class WasmNull::BodyDescriptor : public DataOnlyBodyDescriptor {
  public:
   static_assert(WasmNull::kStartOfStrongFieldsOffset ==
                 WasmNull::kEndOfStrongFieldsOffset);
 
-  static constexpr int kSize = WasmNull::kSize;
-
-  static constexpr int SizeOf(Tagged<Map> map, Tagged<HeapObject> object) {
-    return kSize;
+  static inline int SizeOf(Tagged<Map> map, Tagged<HeapObject> object) {
+    return WasmNull::Size();
   }
 };
 
@@ -1329,7 +1292,8 @@ class InstructionStream::BodyDescriptor final : public BodyDescriptorBase {
       RelocInfo::ModeMask(RelocInfo::INTERNAL_REFERENCE) |
       RelocInfo::ModeMask(RelocInfo::INTERNAL_REFERENCE_ENCODED) |
       RelocInfo::ModeMask(RelocInfo::OFF_HEAP_TARGET) |
-      RelocInfo::ModeMask(RelocInfo::WASM_STUB_CALL);
+      RelocInfo::ModeMask(RelocInfo::WASM_STUB_CALL) |
+      RelocInfo::ModeMask(RelocInfo::JS_DISPATCH_HANDLE);
 
   template <typename ObjectVisitor>
   static inline void IterateBody(Tagged<Map> map, Tagged<HeapObject> obj,
@@ -1423,9 +1387,7 @@ class Code::BodyDescriptor final : public BodyDescriptorBase {
     static_assert(Code::kEndOfStrongFieldsWithMainCageBaseOffset ==
                   Code::kInstructionStreamOffset);
 
-#ifdef V8_ENABLE_LEAPTIERING
     IterateJSDispatchEntry(obj, kDispatchHandleOffset, v);
-#endif  // V8_ENABLE_LEAPTIERING
 
     v->VisitInstructionStreamPointer(
         TrustedCast<Code>(obj),
@@ -1663,9 +1625,7 @@ class FeedbackCell::BodyDescriptor final : public BodyDescriptorBase {
                                  int object_size, ObjectVisitor* v) {
     IteratePointer(obj, kValueOffset, v);
 
-#ifdef V8_ENABLE_LEAPTIERING
     IterateJSDispatchEntry(obj, kDispatchHandleOffset, v);
-#endif
   }
 
   static inline int SizeOf(Tagged<Map> map, Tagged<HeapObject> object) {

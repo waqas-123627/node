@@ -275,12 +275,21 @@ Tagged<HeapObject> Factory::CodeBuilder::AllocateUninitializedInstructionStream(
         heap->heap()->allocator()->AllocateRawWith<HeapAllocator::kRetryOrFail>(
             object_size, AllocationType::kCode, AllocationOrigin::kRuntime);
     CHECK(!result.is_null());
+#if COMPRESS_POINTERS_IN_SHARED_CAGE_BOOL
+    CHECK_IMPLIES(v8_flags.reserve_contiguous_compressed_read_only_space,
+                  (result.ptr() & kContiguousReadOnlySpaceMask) != 0);
+#endif  //  COMPRESS_POINTERS_IN_SHARED_CAGE_BOOL
     return result;
-  } else {
-    // Return null if we cannot allocate the code object.
-    return heap->AllocateRawWith<HeapAllocator::kLightRetry>(
-        object_size, AllocationType::kCode);
   }
+  // Return null if we cannot allocate the code object.
+  result = heap->AllocateRawWith<HeapAllocator::kLightRetry>(
+      object_size, AllocationType::kCode);
+#if COMPRESS_POINTERS_IN_SHARED_CAGE_BOOL
+  CHECK_IMPLIES(v8_flags.reserve_contiguous_compressed_read_only_space &&
+                    !result.is_null(),
+                (result.ptr() & kContiguousReadOnlySpaceMask) != 0);
+#endif  //  COMPRESS_POINTERS_IN_SHARED_CAGE_BOOL
+  return result;
 }
 
 MaybeHandle<Code> Factory::CodeBuilder::TryBuild() {
@@ -444,7 +453,7 @@ MaybeHandle<FixedArray> Factory::TryNewFixedArray(
   if (!allocation.To(&result)) return MaybeHandle<FixedArray>();
   if ((size > heap->MaxRegularHeapObjectSize(allocation_type)) &&
       v8_flags.use_marking_progress_bar) {
-    LargePageMetadata::FromHeapObject(result)
+    LargePageMetadata::FromHeapObject(isolate(), result)
         ->marking_progress_tracker()
         .Enable(size);
   }
@@ -475,10 +484,6 @@ Handle<FeedbackVector> Factory::NewFeedbackVector(
   vector->set_invocation_count_before_stable(0);
   vector->reset_osr_state();
   vector->reset_flags();
-#ifndef V8_ENABLE_LEAPTIERING
-  vector->set_maybe_optimized_code(kClearedWeakValue);
-  vector->set_log_next_execution(v8_flags.log_function_events);
-#endif  // !V8_ENABLE_LEAPTIERING
   vector->set_closure_feedback_cell_array(*closure_feedback_cell_array);
   vector->set_parent_feedback_cell(*parent_feedback_cell);
 
@@ -1820,23 +1825,22 @@ DirectHandle<WasmFastApiCallData> Factory::NewWasmFastApiCallData(
 
 DirectHandle<WasmInternalFunction> Factory::NewWasmInternalFunction(
     DirectHandle<TrustedObject> implicit_arg, int function_index, bool shared,
-    WasmCodePointer call_target) {
+    WasmCodePointer call_target, const wasm::CanonicalSig* sig) {
   Tagged<WasmInternalFunction> internal =
       TrustedCast<WasmInternalFunction>(AllocateRawWithImmortalMap(
           WasmInternalFunction::kSize,
           shared ? AllocationType::kSharedTrusted : AllocationType::kTrusted,
           *wasm_internal_function_map()));
+
+  DisallowGarbageCollection no_gc;
   internal->init_self_indirect_pointer(isolate());
-  {
-    DisallowGarbageCollection no_gc;
-    internal->set_call_target(call_target);
-    DCHECK(IsWasmTrustedInstanceData(*implicit_arg) ||
-           IsWasmImportData(*implicit_arg));
-    internal->set_implicit_arg(*implicit_arg);
-    // Default values, will be overwritten by the caller.
-    internal->set_function_index(function_index);
-    internal->set_external(*undefined_value());
-  }
+  internal->set_call_target(call_target);
+  DCHECK(IsWasmTrustedInstanceData(*implicit_arg) ||
+         IsWasmImportData(*implicit_arg));
+  internal->set_implicit_arg(*implicit_arg);
+  internal->set_function_index(function_index);
+  internal->set_external(*undefined_value());
+  internal->set_sig(sig);
 
   return direct_handle(internal, isolate());
 }
@@ -1857,19 +1861,16 @@ DirectHandle<WasmFuncRef> Factory::NewWasmFuncRef(
 }
 
 DirectHandle<WasmJSFunctionData> Factory::NewWasmJSFunctionData(
-    wasm::CanonicalTypeIndex sig_index, DirectHandle<JSReceiver> callable,
+    const wasm::CanonicalSig* sig, DirectHandle<JSReceiver> callable,
     DirectHandle<Code> wrapper_code, DirectHandle<Map> rtt,
     wasm::Suspend suspend, wasm::Promise promise,
     std::shared_ptr<wasm::WasmImportWrapperHandle> wrapper_handle) {
-  // TODO(clemensb): Should this be passed instead of looked up here?
-  const wasm::CanonicalSig* sig =
-      wasm::GetTypeCanonicalizer()->LookupFunctionSignature(sig_index);
   constexpr bool kShared = false;
   DirectHandle<WasmImportData> import_data = NewWasmImportData(
       callable, suspend, DirectHandle<WasmTrustedInstanceData>(), sig, kShared);
 
   DirectHandle<WasmInternalFunction> internal = NewWasmInternalFunction(
-      import_data, -1, kShared, wrapper_handle->code_pointer());
+      import_data, -1, kShared, wrapper_handle->code_pointer(), sig);
   DirectHandle<WasmFuncRef> func_ref = NewWasmFuncRef(internal, rtt, kShared);
   import_data->SetFuncRefAsCallOrigin(*internal);
 
@@ -1892,7 +1893,6 @@ DirectHandle<WasmJSFunctionData> Factory::NewWasmJSFunctionData(
   result->set_func_ref(*func_ref);
   result->set_internal(*internal);
   result->set_wrapper_code(*wrapper_code);
-  result->set_canonical_sig_index(sig_index.index);
   result->set_js_promise_flags(WasmFunctionData::SuspendField::encode(suspend) |
                                WasmFunctionData::PromiseField::encode(promise));
   result->set_protected_offheap_data(*offheap_data);
@@ -1912,7 +1912,6 @@ DirectHandle<WasmResumeData> Factory::NewWasmResumeData(
 }
 
 DirectHandle<WasmSuspenderObject> Factory::NewWasmSuspenderObject() {
-  DirectHandle<JSPromise> promise = NewJSPromise();
   Tagged<Map> map = *wasm_suspender_object_map();
   Tagged<WasmSuspenderObject> obj =
       TrustedCast<WasmSuspenderObject>(AllocateRawWithImmortalMap(
@@ -1922,9 +1921,16 @@ DirectHandle<WasmSuspenderObject> Factory::NewWasmSuspenderObject() {
   suspender->init_self_indirect_pointer(isolate());
   suspender->init_stack(IsolateForSandbox(isolate()), nullptr);
   suspender->clear_parent();
-  suspender->set_promise(*promise);
+  suspender->set_promise(*undefined_value());
   suspender->set_resume(*undefined_value());
   suspender->set_reject(*undefined_value());
+  return suspender;
+}
+
+DirectHandle<WasmSuspenderObject> Factory::NewWasmSuspenderObjectInitialized() {
+  DirectHandle<JSPromise> promise = NewJSPromise();
+  DirectHandle<WasmSuspenderObject> suspender = NewWasmSuspenderObject();
+  suspender->set_promise(*promise);
   // Instantiate the callable object which resumes this Suspender. This will be
   // used implicitly as the onFulfilled callback of the returned JS promise.
   DirectHandle<WasmResumeData> resume_data =
@@ -1955,9 +1961,12 @@ DirectHandle<WasmContinuationObject> Factory::NewWasmContinuationObject() {
   DirectHandle<WasmContinuationObject> cont(obj, isolate());
   cont->init_stack(IsolateForSandbox(isolate()), nullptr);
   std::unique_ptr<wasm::StackMemory> stack = wasm::StackMemory::New();
-  stack->jmpbuf()->fp = stack->base();
+  stack->jmpbuf()->fp = kNullAddress;
   stack->jmpbuf()->sp = stack->base();
   stack->jmpbuf()->state = wasm::JumpBuffer::Suspended;
+  stack->jmpbuf()->stack_limit = stack->jslimit();
+  stack->jmpbuf()->is_on_central_stack = false;
+  stack->jmpbuf()->parent = nullptr;
   stack->set_index(isolate()->wasm_stacks().size());
   cont->set_stack(isolate(), stack.get());
   isolate()->wasm_stacks().emplace_back(std::move(stack));
@@ -1968,9 +1977,8 @@ DirectHandle<WasmExportedFunctionData> Factory::NewWasmExportedFunctionData(
     DirectHandle<Code> export_wrapper,
     DirectHandle<WasmTrustedInstanceData> instance_data,
     DirectHandle<WasmFuncRef> func_ref,
-    DirectHandle<WasmInternalFunction> internal_function,
-    const wasm::CanonicalSig* sig, wasm::CanonicalTypeIndex type_index,
-    int wrapper_budget, wasm::Promise promise) {
+    DirectHandle<WasmInternalFunction> internal_function, int wrapper_budget,
+    wasm::Promise promise) {
   int func_index = internal_function->function_index();
   DirectHandle<Cell> wrapper_budget_cell =
       NewCell(Smi::FromInt(wrapper_budget));
@@ -1985,8 +1993,6 @@ DirectHandle<WasmExportedFunctionData> Factory::NewWasmExportedFunctionData(
   result->set_wrapper_code(*export_wrapper);
   result->set_instance_data(*instance_data);
   result->set_function_index(func_index);
-  result->set_sig(sig);
-  result->set_canonical_type_index(type_index.index);
   result->set_receiver_is_first_param(0);
   result->set_wrapper_budget(*wrapper_budget_cell);
   // We can't skip the write barrier because Code objects are not immovable.
@@ -2002,7 +2008,7 @@ DirectHandle<WasmExportedFunctionData> Factory::NewWasmExportedFunctionData(
 DirectHandle<WasmCapiFunctionData> Factory::NewWasmCapiFunctionData(
     Address call_target, DirectHandle<Foreign> embedder_data,
     DirectHandle<Code> wrapper_code, DirectHandle<Map> rtt,
-    wasm::CanonicalTypeIndex sig_index, const wasm::CanonicalSig* sig) {
+    const wasm::CanonicalSig* sig) {
   constexpr bool kShared = false;
   DirectHandle<WasmImportData> import_data =
       NewWasmImportData(undefined_value(), wasm::kNoSuspend,
@@ -2010,7 +2016,8 @@ DirectHandle<WasmCapiFunctionData> Factory::NewWasmCapiFunctionData(
   DirectHandle<WasmInternalFunction> internal = NewWasmInternalFunction(
       import_data, -1, kShared,
       wasm::GetProcessWideWasmCodePointerTable()
-          ->GetOrCreateHandleForNativeFunction(call_target));
+          ->GetOrCreateHandleForNativeFunction(call_target),
+      sig);
   DirectHandle<WasmFuncRef> func_ref = NewWasmFuncRef(internal, rtt, kShared);
   // We have no generic wrappers for C-API functions, so we don't need to
   // set any call origin on {import_data}.
@@ -2022,10 +2029,8 @@ DirectHandle<WasmCapiFunctionData> Factory::NewWasmCapiFunctionData(
   DisallowGarbageCollection no_gc;
   result->set_func_ref(*func_ref);
   result->set_internal(*internal);
-  result->set_canonical_sig_index(sig_index.index);
   result->set_wrapper_code(*wrapper_code);
   result->set_embedder_data(*embedder_data);
-  result->set_sig(sig);
   result->set_js_promise_flags(
       WasmFunctionData::SuspendField::encode(wasm::kNoSuspend) |
       WasmFunctionData::PromiseField::encode(wasm::kNoPromise));
@@ -2234,9 +2239,7 @@ DirectHandle<FeedbackCell> Factory::NewNoClosuresCell() {
   DisallowGarbageCollection no_gc;
   result->set_value(read_only_roots().undefined_value());
   result->clear_interrupt_budget();
-#ifdef V8_ENABLE_LEAPTIERING
   result->clear_dispatch_handle();
-#endif  // V8_ENABLE_LEAPTIERING
   result->clear_padding();
   return direct_handle(result, isolate());
 }
@@ -2249,9 +2252,7 @@ DirectHandle<FeedbackCell> Factory::NewOneClosureCell(
   DisallowGarbageCollection no_gc;
   result->set_value(*value);
   result->clear_interrupt_budget();
-#ifdef V8_ENABLE_LEAPTIERING
   result->clear_dispatch_handle();
-#endif  // V8_ENABLE_LEAPTIERING
   result->clear_padding();
   return direct_handle(result, isolate());
 }
@@ -2947,11 +2948,11 @@ DirectHandle<JSObject> Factory::NewFunctionPrototype(
   return prototype;
 }
 
-Handle<JSObject> Factory::NewExternal(void* value,
+Handle<JSObject> Factory::NewExternal(void* value, ExternalPointerTag tag,
                                       AllocationType allocation_type) {
   auto external = Cast<JSExternalObject>(
       NewJSObjectFromMap(external_map(), allocation_type));
-  external->init_value(isolate(), value);
+  external->init_value(isolate(), tag, value);
   return external;
 }
 
@@ -3119,8 +3120,8 @@ Handle<JSGlobalObject> Factory::NewJSGlobalObject(
   // Allocate the global object and initialize it with the backing store.
   Handle<JSGlobalObject> global(
       Cast<JSGlobalObject>(New(map, AllocationType::kOld)), isolate());
-  InitializeJSObjectFromMap(*global, *dictionary, *map,
-                            NewJSObjectType::kAPIWrapper);
+  InitializeJSObjectFromMap(*map, *global, {*dictionary},
+                            NewJSObjectType::kMaybeEmbedderFieldsAndApiWrapper);
 
   // Create a new map for the global object.
   DirectHandle<Map> new_map = Map::CopyDropDescriptors(isolate(), map);
@@ -3138,12 +3139,16 @@ Handle<JSGlobalObject> Factory::NewJSGlobalObject(
   return global;
 }
 
-void Factory::InitializeJSObjectFromMap(Tagged<JSObject> obj,
-                                        Tagged<Object> properties,
-                                        Tagged<Map> map,
-                                        NewJSObjectType new_js_object_type) {
+void Factory::InitializeJSObjectFromMap(
+    Tagged<Map> map, Tagged<JSObject> obj,
+    std::optional<Tagged<Object>> maybe_properties,
+    NewJSObjectType new_js_object_type) {
   DisallowGarbageCollection no_gc;
-  obj->set_raw_properties_or_hash(properties, kRelaxedStore);
+  if (!maybe_properties.has_value()) {
+    obj->set_raw_properties_or_hash(*empty_fixed_array(), SKIP_WRITE_BARRIER);
+  } else {
+    obj->set_raw_properties_or_hash(maybe_properties.value(), kRelaxedStore);
+  }
   obj->initialize_elements();
   // TODO(1240798): Initialize the object's body using valid initial values
   // according to the object's initial map.  For example, if the map's
@@ -3152,19 +3157,24 @@ void Factory::InitializeJSObjectFromMap(Tagged<JSObject> obj,
   // fixed array (e.g. Heap::empty_fixed_array()).  Currently, the object
   // verification code has to cope with (temporarily) invalid objects.  See
   // for example, JSArray::JSArrayVerify).
-  DCHECK_EQ(IsJSApiWrapperObjectMap(map),
-            new_js_object_type == NewJSObjectType::kAPIWrapper);
-  InitializeJSObjectBody(obj, map,
-                         new_js_object_type == NewJSObjectType::kNoAPIWrapper
-                             ? JSObject::kHeaderSize
-                             : JSAPIObjectWithEmbedderSlots::kHeaderSize);
-  if (new_js_object_type == NewJSObjectType::kAPIWrapper) {
+  DCHECK_EQ(
+      IsJSApiWrapperObjectMap(map),
+      new_js_object_type == NewJSObjectType::kMaybeEmbedderFieldsAndApiWrapper);
+  InitializeJSObjectBody(
+      obj, map,
+      new_js_object_type == NewJSObjectType::kMaybeEmbedderFieldsAndApiWrapper
+          ? JSAPIObjectWithEmbedderSlots::kHeaderSize
+          : JSObject::kHeaderSize,
+      new_js_object_type);
+  if (new_js_object_type ==
+      NewJSObjectType::kMaybeEmbedderFieldsAndApiWrapper) {
     CppHeapObjectWrapper(obj).InitializeCppHeapWrapper();
   }
 }
 
 void Factory::InitializeJSObjectBody(Tagged<JSObject> obj, Tagged<Map> map,
-                                     int start_offset) {
+                                     int start_offset,
+                                     NewJSObjectType new_js_object_type) {
   DisallowGarbageCollection no_gc;
   if (start_offset == map->instance_size()) return;
   DCHECK_LT(start_offset, map->instance_size());
@@ -3179,9 +3189,7 @@ void Factory::InitializeJSObjectBody(Tagged<JSObject> obj, Tagged<Map> map,
   // In case of Array subclassing the |map| could already be transitioned
   // to different elements kind from the initial map on which we track slack.
   bool in_progress = map->IsInobjectSlackTrackingInProgress();
-  obj->InitializeBody(map, start_offset, in_progress,
-                      ReadOnlyRoots(isolate()).one_pointer_filler_map_word(),
-                      *undefined_value());
+  obj->InitializeBody(map, start_offset, in_progress, new_js_object_type);
   if (in_progress) {
     map->FindRootMap(isolate())->InobjectSlackTrackingStep(isolate());
   }
@@ -3202,8 +3210,7 @@ Handle<JSObject> Factory::NewJSObjectFromMap(
   Tagged<JSObject> js_obj = Cast<JSObject>(
       AllocateRawWithAllocationSite(map, allocation, allocation_site));
 
-  InitializeJSObjectFromMap(js_obj, *empty_fixed_array(), *map,
-                            new_js_object_type);
+  InitializeJSObjectFromMap(*map, js_obj, {}, new_js_object_type);
 
   DCHECK(js_obj->HasFastElements() ||
          (isolate()->bootstrapper()->IsActive() ||
@@ -3409,7 +3416,7 @@ DirectHandle<JSModuleNamespace> Factory::NewJSModuleNamespace() {
   DirectHandle<JSModuleNamespace> module_namespace(
       Cast<JSModuleNamespace>(NewJSObjectFromMap(
           map, AllocationType::kYoung, DirectHandle<AllocationSite>::null(),
-          NewJSObjectType::kAPIWrapper)));
+          NewJSObjectType::kMaybeEmbedderFieldsAndApiWrapper)));
   FieldIndex index = FieldIndex::ForDescriptor(
       *map, InternalIndex(JSModuleNamespace::kToStringTagFieldIndex));
   module_namespace->FastPropertyAtPut(index, read_only_roots().Module_string(),
@@ -3554,7 +3561,7 @@ Handle<JSArrayBuffer> Factory::NewJSArrayBuffer(
   }
   auto result = Cast<JSArrayBuffer>(
       NewJSObjectFromMap(map, allocation, DirectHandle<AllocationSite>::null(),
-                         NewJSObjectType::kAPIWrapper));
+                         NewJSObjectType::kMaybeEmbedderFieldsAndApiWrapper));
   result->Setup(SharedFlag::kNotShared, resizable_by_js,
                 std::move(backing_store), isolate());
   return result;
@@ -3599,7 +3606,7 @@ MaybeHandle<JSArrayBuffer> Factory::NewJSArrayBufferAndBackingStore(
       isolate());
   auto array_buffer = Cast<JSArrayBuffer>(
       NewJSObjectFromMap(map, allocation, DirectHandle<AllocationSite>::null(),
-                         NewJSObjectType::kAPIWrapper));
+                         NewJSObjectType::kMaybeEmbedderFieldsAndApiWrapper));
   array_buffer->Setup(SharedFlag::kNotShared, resizable,
                       std::move(backing_store), isolate());
   return array_buffer;
@@ -3612,7 +3619,7 @@ Handle<JSArrayBuffer> Factory::NewJSSharedArrayBuffer(
       isolate());
   auto result = Cast<JSArrayBuffer>(NewJSObjectFromMap(
       map, AllocationType::kYoung, DirectHandle<AllocationSite>::null(),
-      NewJSObjectType::kAPIWrapper));
+      NewJSObjectType::kMaybeEmbedderFieldsAndApiWrapper));
   ResizableFlag resizable = backing_store->is_resizable_by_js()
                                 ? ResizableFlag::kResizable
                                 : ResizableFlag::kNotResizable;
@@ -3693,7 +3700,7 @@ Handle<JSArrayBufferView> Factory::NewJSArrayBufferView(
   Handle<JSArrayBufferView> array_buffer_view =
       Cast<JSArrayBufferView>(NewJSObjectFromMap(
           map, AllocationType::kYoung, DirectHandle<AllocationSite>::null(),
-          NewJSObjectType::kAPIWrapper));
+          NewJSObjectType::kMaybeEmbedderFieldsAndApiWrapper));
   DisallowGarbageCollection no_gc;
   Tagged<JSArrayBufferView> raw = *array_buffer_view;
   raw->set_elements(*elements, SKIP_WRITE_BARRIER);
@@ -3874,7 +3881,7 @@ Handle<JSGlobalProxy> Factory::NewUninitializedJSGlobalProxy(int size) {
   }
   Handle<JSGlobalProxy> proxy = Cast<JSGlobalProxy>(NewJSObjectFromMap(
       map, AllocationType::kOld, DirectHandle<AllocationSite>::null(),
-      NewJSObjectType::kAPIWrapper));
+      NewJSObjectType::kMaybeEmbedderFieldsAndApiWrapper));
   // Create identity hash early in case there is any JS collection containing
   // a global proxy key and needs to be rehashed after deserialization.
   proxy->GetOrCreateIdentityHash(isolate());
@@ -3912,8 +3919,8 @@ void Factory::ReinitializeJSGlobalProxy(DirectHandle<JSGlobalProxy> object,
   raw->set_map(isolate(), *map, kReleaseStore);
 
   // Reinitialize the object from the constructor map.
-  InitializeJSObjectFromMap(raw, *raw_properties_or_hash, *map,
-                            NewJSObjectType::kAPIWrapper);
+  InitializeJSObjectFromMap(*map, raw, {*raw_properties_or_hash},
+                            NewJSObjectType::kMaybeEmbedderFieldsAndApiWrapper);
   // Ensure that the object and constructor belongs to the same native context.
   DCHECK_EQ(object->map()->map(), constructor->map()->map());
 }
@@ -4869,7 +4876,6 @@ Handle<JSFunction> Factory::JSFunctionBuilder::BuildRaw(
     function->set_context(*context_, kReleaseStore, mode);
     function->set_raw_feedback_cell(*feedback_cell, mode);
 
-#ifdef V8_ENABLE_LEAPTIERING
     if (!many_closures_cell) {
       // TODO(olivf, 42204201): Here we are explicitly not updating (only
       // potentially initializing) the code. Worst case the dispatch handle
@@ -4915,10 +4921,6 @@ Handle<JSFunction> Factory::JSFunctionBuilder::BuildRaw(
         }
       }
     }
-#else
-    USE(cell_transition, many_closures_cell);
-    function->UpdateCode(isolate, *code, mode);
-#endif  // V8_ENABLE_LEAPTIERING
 
     if (function->has_prototype_slot()) {
       function->set_prototype_or_initial_map(
@@ -4933,7 +4935,6 @@ Handle<JSFunction> Factory::JSFunctionBuilder::BuildRaw(
     function_handle = handle(function, isolate_);
   }
 
-#ifdef V8_ENABLE_LEAPTIERING
   // If the FeedbackCell doesn't have a dispatch handle, we need to allocate a
   // dispatch entry now. This should only be the case for functions using the
   // generic many_closures_cell (for example builtin functions), and only for
@@ -4955,7 +4956,6 @@ Handle<JSFunction> Factory::JSFunctionBuilder::BuildRaw(
   } else {
     DCHECK_NE(function_handle->dispatch_handle(), kNullJSDispatchHandle);
   }
-#endif
 
   return function_handle;
 }

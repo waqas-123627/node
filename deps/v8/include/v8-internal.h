@@ -10,6 +10,8 @@
 #include <string.h>
 
 #include <atomic>
+#include <compare>
+#include <concepts>
 #include <iterator>
 #include <limits>
 #include <memory>
@@ -17,22 +19,6 @@
 #include <type_traits>
 
 #include "v8config.h"  // NOLINT(build/include_directory)
-
-// TODO(pkasting): Use <compare>/spaceship unconditionally after dropping
-// support for old libstdc++ versions.
-#if __has_include(<version>)
-#include <version>
-#endif
-#if defined(__cpp_lib_three_way_comparison) &&   \
-    __cpp_lib_three_way_comparison >= 201711L && \
-    defined(__cpp_lib_concepts) && __cpp_lib_concepts >= 202002L
-#include <compare>
-#include <concepts>
-
-#define V8_HAVE_SPACESHIP_OPERATOR 1
-#else
-#define V8_HAVE_SPACESHIP_OPERATOR 0
-#endif
 
 namespace v8 {
 
@@ -421,10 +407,15 @@ constexpr size_t kMaxCppHeapPointers = 0;
 
 #endif  // V8_COMPRESS_POINTERS
 
-// The number of tags reserved for embedder data. The value is picked
-// arbitrarily. In Chrome there are 4 embedders, so at least 4 tags are needed.
-// A generic tag was used for embedder data before, so one tag is used for that.
-#define V8_EMBEDDER_DATA_TAG_COUNT 5
+// The number of tags reserved for embedder data stored in internal fields. The
+// value is picked arbitrarily, and is slightly larger than the number of tags
+// currently used in Chrome.
+#define V8_EMBEDDER_DATA_TAG_COUNT 15
+
+// The number of tags reserved for pointers stored in v8::External. The value is
+// picked arbitrarily, and is slightly larger than the number of tags currently
+// used in Chrome.
+#define V8_EXTERNAL_POINTER_TAG_COUNT 100
 
 // Generic tag range struct to represent ranges of type tags.
 //
@@ -433,6 +424,19 @@ constexpr size_t kMaxCppHeapPointers = 0;
 // support for subtyping is necessary, range-based type checks are used in
 // which all subtypes of a given supertype use contiguous tags. This struct can
 // then be used to represent such a type range.
+//
+// As an example, consider the following type hierarchy:
+//
+//          A     F
+//         / \
+//        B   E
+//       / \
+//      C   D
+//
+// A potential type id assignment for range-based type checks is
+// {A: 0, B: 1, C: 2, D: 3, E: 4, F: 5}. With that, the type check for type A
+// would check for the range [A, E], while the check for B would check range
+// [B, D], and for F it would simply check [F, F].
 //
 // In addition, there is an option for performance tweaks: if the size of the
 // type range corresponding to a supertype is a power of two and starts at a
@@ -566,11 +570,19 @@ enum ExternalPointerTag : uint16_t {
   // Placeholders for embedder data.
   kFirstEmbedderDataTag,
   kLastEmbedderDataTag = kFirstEmbedderDataTag + V8_EMBEDDER_DATA_TAG_COUNT - 1,
-  kEmbedderDataSlotPayloadTag = kLastEmbedderDataTag,
+
+  // Placeholders for pointers store in v8::External.
+  kFirstExternalTypeTag,
+  kLastExternalTypeTag =
+      kFirstExternalTypeTag + V8_EXTERNAL_POINTER_TAG_COUNT - 1,
+  // This tag is used when a fast-api callback as a parameter of type
+  // `kPointer`. The V8 fast API is only able to use this generic tag, and is
+  // therefore not supposed to be used in Chrome.
+  kFastApiExternalTypeTag = kLastExternalTypeTag,
   // This tag essentially stands for a `void*` pointer in the V8 API, and it is
   // the Embedder's responsibility to ensure type safety (against substitution)
   // and lifetime validity of these objects.
-  kExternalObjectValueTag,
+  kExternalObjectValueTag = kFirstExternalTypeTag,
   kFirstMaybeReadOnlyExternalPointerTag,
   kFunctionTemplateInfoCallbackTag = kFirstMaybeReadOnlyExternalPointerTag,
   kAccessorInfoGetterTag,
@@ -1025,16 +1037,12 @@ class Internals {
   using Tagged_t = uint32_t;
   struct StaticReadOnlyRoot {
 #ifdef V8_ENABLE_WEBASSEMBLY
-#ifdef V8_INTL_SUPPORT
-    static constexpr Tagged_t kBuildDependentTheHoleValue = 0x67b9;
-#else
-    static constexpr Tagged_t kBuildDependentTheHoleValue = 0x5b1d;
-#endif
+    static constexpr Tagged_t kBuildDependentTheHoleValue = 0x20001;
 #else
 #ifdef V8_INTL_SUPPORT
-    static constexpr Tagged_t kBuildDependentTheHoleValue = 0x6511;
+    static constexpr Tagged_t kBuildDependentTheHoleValue = 0x6559;
 #else
-    static constexpr Tagged_t kBuildDependentTheHoleValue = 0x5875;
+    static constexpr Tagged_t kBuildDependentTheHoleValue = 0x58bd;
 #endif
 #endif
 
@@ -1328,18 +1336,6 @@ class Internals {
 #endif
   }
 
-  V8_DEPRECATED(
-      "Use GetCurrentIsolateForSandbox() instead, which is guaranteed to "
-      "return the same isolate since https://crrev.com/c/6458560.")
-  V8_INLINE static v8::Isolate* GetIsolateForSandbox(Address obj) {
-#ifdef V8_ENABLE_SANDBOX
-    return GetCurrentIsolate();
-#else
-    // Not used in non-sandbox mode.
-    return nullptr;
-#endif
-  }
-
   // Returns v8::Isolate::Current(), but without needing to include the
   // v8-isolate.h header.
   V8_EXPORT static v8::Isolate* GetCurrentIsolate();
@@ -1359,6 +1355,34 @@ class Internals {
                                                     int offset) {
 #ifdef V8_ENABLE_SANDBOX
     static_assert(!tag_range.IsEmpty());
+    // See src/sandbox/external-pointer-table.h. Logic duplicated here so
+    // it can be inlined and doesn't require an additional call.
+    Address* table = IsSharedExternalPointerType(tag_range)
+                         ? GetSharedExternalPointerTableBase(isolate)
+                         : GetExternalPointerTableBase(isolate);
+    internal::ExternalPointerHandle handle =
+        ReadRawField<ExternalPointerHandle>(heap_object_ptr, offset);
+    uint32_t index = handle >> kExternalPointerIndexShift;
+    std::atomic<Address>* ptr =
+        reinterpret_cast<std::atomic<Address>*>(&table[index]);
+    Address entry = std::atomic_load_explicit(ptr, std::memory_order_relaxed);
+    ExternalPointerTag actual_tag = static_cast<ExternalPointerTag>(
+        (entry & kExternalPointerTagMask) >> kExternalPointerTagShift);
+    if (V8_LIKELY(tag_range.Contains(actual_tag))) {
+      return entry & kExternalPointerPayloadMask;
+    } else {
+      return 0;
+    }
+    return entry;
+#else
+    return ReadRawField<Address>(heap_object_ptr, offset);
+#endif  // V8_ENABLE_SANDBOX
+  }
+
+  V8_INLINE static Address ReadExternalPointerField(
+      v8::Isolate* isolate, Address heap_object_ptr, int offset,
+      ExternalPointerTagRange tag_range) {
+#ifdef V8_ENABLE_SANDBOX
     // See src/sandbox/external-pointer-table.h. Logic duplicated here so
     // it can be inlined and doesn't require an additional call.
     Address* table = IsSharedExternalPointerType(tag_range)
@@ -1439,12 +1463,7 @@ class V8_EXPORT StrongRootAllocatorBase {
  public:
   Heap* heap() const { return heap_; }
 
-  friend bool operator==(const StrongRootAllocatorBase& a,
-                         const StrongRootAllocatorBase& b) {
-    // TODO(pkasting): Replace this body with `= default` after dropping support
-    // for old gcc versions.
-    return a.heap_ == b.heap_;
-  }
+  constexpr bool operator==(const StrongRootAllocatorBase&) const = default;
 
  protected:
   explicit StrongRootAllocatorBase(Heap* heap) : heap_(heap) {}
@@ -1480,45 +1499,29 @@ class StrongRootAllocator : private std::allocator<T> {
   using std::allocator<T>::deallocate;
 };
 
-// TODO(pkasting): Replace with `requires` clauses after dropping support for
-// old gcc versions.
-template <typename Iterator, typename = void>
-inline constexpr bool kHaveIteratorConcept = false;
 template <typename Iterator>
-inline constexpr bool kHaveIteratorConcept<
-    Iterator, std::void_t<typename Iterator::iterator_concept>> = true;
+concept HasIteratorConcept = requires { typename Iterator::iterator_concept; };
 
-template <typename Iterator, typename = void>
-inline constexpr bool kHaveIteratorCategory = false;
 template <typename Iterator>
-inline constexpr bool kHaveIteratorCategory<
-    Iterator, std::void_t<typename Iterator::iterator_category>> = true;
+concept HasIteratorCategory =
+    requires { typename Iterator::iterator_category; };
 
 // Helper struct that contains an `iterator_concept` type alias only when either
 // `Iterator` or `std::iterator_traits<Iterator>` do.
 // Default: no alias.
-template <typename Iterator, typename = void>
+template <typename Iterator>
 struct MaybeDefineIteratorConcept {};
 // Use `Iterator::iterator_concept` if available.
-template <typename Iterator>
-struct MaybeDefineIteratorConcept<
-    Iterator, std::enable_if_t<kHaveIteratorConcept<Iterator>>> {
+template <HasIteratorConcept Iterator>
+struct MaybeDefineIteratorConcept<Iterator> {
   using iterator_concept = typename Iterator::iterator_concept;
 };
 // Otherwise fall back to `std::iterator_traits<Iterator>` if possible.
 template <typename Iterator>
-struct MaybeDefineIteratorConcept<
-    Iterator, std::enable_if_t<kHaveIteratorCategory<Iterator> &&
-                               !kHaveIteratorConcept<Iterator>>> {
-  // There seems to be no feature-test macro covering this, so use the
-  // presence of `<ranges>` as a crude proxy, since it was added to the
-  // standard as part of the Ranges papers.
-  // TODO(pkasting): Add this unconditionally after dropping support for old
-  // libstdc++ versions.
-#if __has_include(<ranges>)
+  requires(HasIteratorCategory<Iterator> && !HasIteratorConcept<Iterator>)
+struct MaybeDefineIteratorConcept<Iterator> {
   using iterator_concept =
       typename std::iterator_traits<Iterator>::iterator_concept;
-#endif
 };
 
 // A class of iterators that wrap some different iterator type.
@@ -1555,11 +1558,8 @@ class WrappedIterator : public MaybeDefineIteratorConcept<Iterator> {
   constexpr WrappedIterator() noexcept = default;
   constexpr explicit WrappedIterator(Iterator it) noexcept : it_(it) {}
 
-  // TODO(pkasting): Switch to `requires` and concepts after dropping support
-  // for old gcc and libstdc++ versions.
-  template <typename OtherIterator, typename OtherElementType,
-            typename = std::enable_if_t<
-                std::is_convertible_v<OtherIterator, Iterator>>>
+  template <typename OtherIterator, typename OtherElementType>
+    requires std::is_convertible_v<OtherIterator, Iterator>
   constexpr WrappedIterator(
       const WrappedIterator<OtherIterator, OtherElementType>& other) noexcept
       : it_(other.base()) {}
@@ -1579,7 +1579,7 @@ class WrappedIterator : public MaybeDefineIteratorConcept<Iterator> {
       const noexcept {
     return it_ == other.base();
   }
-#if V8_HAVE_SPACESHIP_OPERATOR
+
   template <typename OtherIterator, typename OtherElementType>
   [[nodiscard]] constexpr auto operator<=>(
       const WrappedIterator<OtherIterator, OtherElementType>& other)
@@ -1603,41 +1603,6 @@ class WrappedIterator : public MaybeDefineIteratorConcept<Iterator> {
                                    : std::partial_ordering::unordered;
     }
   }
-#else
-  // Assume that if spaceship isn't present, operator rewriting might not be
-  // either.
-  template <typename OtherIterator, typename OtherElementType>
-  [[nodiscard]] constexpr bool operator!=(
-      const WrappedIterator<OtherIterator, OtherElementType>& other)
-      const noexcept {
-    return it_ != other.base();
-  }
-
-  template <typename OtherIterator, typename OtherElementType>
-  [[nodiscard]] constexpr bool operator<(
-      const WrappedIterator<OtherIterator, OtherElementType>& other)
-      const noexcept {
-    return it_ < other.base();
-  }
-  template <typename OtherIterator, typename OtherElementType>
-  [[nodiscard]] constexpr bool operator<=(
-      const WrappedIterator<OtherIterator, OtherElementType>& other)
-      const noexcept {
-    return it_ <= other.base();
-  }
-  template <typename OtherIterator, typename OtherElementType>
-  [[nodiscard]] constexpr bool operator>(
-      const WrappedIterator<OtherIterator, OtherElementType>& other)
-      const noexcept {
-    return it_ > other.base();
-  }
-  template <typename OtherIterator, typename OtherElementType>
-  [[nodiscard]] constexpr bool operator>=(
-      const WrappedIterator<OtherIterator, OtherElementType>& other)
-      const noexcept {
-    return it_ >= other.base();
-  }
-#endif
 
   constexpr WrappedIterator& operator++() noexcept {
     ++it_;

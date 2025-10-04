@@ -72,6 +72,8 @@ namespace v8 {
 namespace internal {
 namespace test_cpu_profiler {
 
+constexpr v8::EmbedderDataTypeTag kFastApiReceiverTag = 1;
+
 // Helper methods
 static v8::Local<v8::Function> GetFunction(v8::Local<v8::Context> env,
                                            const char* name) {
@@ -994,6 +996,8 @@ static const char* native_accessor_test_source =
     "  }\n"
     "}\n";
 
+constexpr v8::ExternalPointerTypeTag kTestApiCallbacksTag = 86;
+
 class TestApiCallbacks {
  public:
   explicit TestApiCallbacks(int min_duration_ms)
@@ -1032,7 +1036,7 @@ class TestApiCallbacks {
 
   template <typename T>
   static TestApiCallbacks* FromInfo(const T& info) {
-    void* data = v8::External::Cast(*info.Data())->Value();
+    void* data = v8::External::Cast(*info.Data())->Value(kTestApiCallbacksTag);
     return reinterpret_cast<TestApiCallbacks*>(data);
   }
 
@@ -1055,7 +1059,8 @@ TEST(NativeAccessorUninitializedIC) {
       func_template->InstanceTemplate();
 
   TestApiCallbacks accessors(100);
-  v8::Local<v8::External> data = v8::External::New(isolate, &accessors);
+  v8::Local<v8::External> data =
+      v8::External::New(isolate, &accessors, kTestApiCallbacksTag);
   instance_template->SetNativeDataProperty(v8_str("foo"),
                                            &TestApiCallbacks::Getter,
                                            &TestApiCallbacks::Setter, data);
@@ -1095,7 +1100,8 @@ TEST(NativeAccessorMonomorphicIC) {
       func_template->InstanceTemplate();
 
   TestApiCallbacks accessors(1);
-  v8::Local<v8::External> data = v8::External::New(isolate, &accessors);
+  v8::Local<v8::External> data =
+      v8::External::New(isolate, &accessors, kTestApiCallbacksTag);
   instance_template->SetNativeDataProperty(v8_str("foo"),
                                            &TestApiCallbacks::Getter,
                                            &TestApiCallbacks::Setter, data);
@@ -1146,7 +1152,8 @@ TEST(NativeMethodUninitializedIC) {
   v8::HandleScope scope(isolate);
 
   TestApiCallbacks callbacks(100);
-  v8::Local<v8::External> data = v8::External::New(isolate, &callbacks);
+  v8::Local<v8::External> data =
+      v8::External::New(isolate, &callbacks, kTestApiCallbacksTag);
 
   v8::Local<v8::FunctionTemplate> func_template =
       v8::FunctionTemplate::New(isolate);
@@ -1187,7 +1194,8 @@ TEST(NativeMethodMonomorphicIC) {
   v8::HandleScope scope(isolate);
 
   TestApiCallbacks callbacks(1);
-  v8::Local<v8::External> data = v8::External::New(isolate, &callbacks);
+  v8::Local<v8::External> data =
+      v8::External::New(isolate, &callbacks, kTestApiCallbacksTag);
 
   v8::Local<v8::FunctionTemplate> func_template =
       v8::FunctionTemplate::New(isolate);
@@ -1968,7 +1976,7 @@ TEST(InliningTopLevel) {
   CompileRun(inlining_top_level_test_source);
   v8::Local<v8::Function> function = GetFunction(env, "start");
 
-  static const unsigned min_samples = 10;
+  static const unsigned min_samples = 100;
   v8::CpuProfile* profile = helper.Run(function, nullptr, 0, min_samples);
 
   const v8::CpuProfileNode* root = profile->GetTopDownRoot();
@@ -4481,15 +4489,15 @@ UNINITIALIZED_TEST(DetailedSourcePositionAPI_Inlining) {
 namespace {
 
 struct FastApiReceiver {
-  static void FastCallback(v8::Local<v8::Object> receiver, int argument,
+  static void FastCallback(v8::Local<v8::Object> receiver_obj, int argument,
                            v8::FastApiCallbackOptions& options) {
     // TODO(mslekova): The fallback is not used by the test. Replace this
     // with a CHECK.
-    CHECK(IsValidUnwrapObject(*receiver));
-    FastApiReceiver* receiver_ptr =
-        GetInternalField<FastApiReceiver>(*receiver);
+    CHECK(IsValidUnwrapObject(*receiver_obj));
+    FastApiReceiver* receiver =
+        GetInternalField<FastApiReceiver>(*receiver_obj, kFastApiReceiverTag);
 
-    receiver_ptr->result_ |= ApiCheckerResult::kFastCalled;
+    receiver->result_ |= ApiCheckerResult::kFastCalled;
 
     // Artificially slow down the callback with a predictable amount of time.
     // This ensures the test has a relatively stable run time on various
@@ -4503,7 +4511,8 @@ struct FastApiReceiver {
       info.GetIsolate()->ThrowError("Called with a non-object.");
       return;
     }
-    FastApiReceiver* receiver = GetInternalField<FastApiReceiver>(receiver_obj);
+    FastApiReceiver* receiver =
+        GetInternalField<FastApiReceiver>(receiver_obj, kFastApiReceiverTag);
 
     receiver->result_ |= ApiCheckerResult::kSlowCalled;
   }
@@ -4704,8 +4713,6 @@ TEST(FastApiCPUProfiler) {
 
   v8::Local<v8::Object> object =
       object_template->NewInstance(env.local()).ToLocalChecked();
-
-  constexpr v8::EmbedderDataTypeTag kFastApiReceiverTag = 1;
 
   object->SetAlignedPointerInInternalField(kV8WrapperObjectIndex,
                                            reinterpret_cast<void*>(&receiver),

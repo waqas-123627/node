@@ -2182,7 +2182,7 @@ inline void RegExpMatchGlobalAtom_OneCharPattern(
   // We need a wider tag to avoid overflows on lanes when summing up submatches.
   using WidenedTag = hw::RepartitionToWide<decltype(tag)>;
   WidenedTag sum_tag;
-  static constexpr size_t stride = hw::Lanes(tag);
+  static const size_t stride = hw::Lanes(tag);
   // Subtle: the valid variants are {SChar,PChar} in:
   // {uint8_t,uint8_t}, {uc16,uc16}, {uc16,uint8_t}. In the latter case,
   // we cast the uint8_t pattern to uc16 for the comparison.
@@ -2203,7 +2203,9 @@ inline void RegExpMatchGlobalAtom_OneCharPattern(
   while (block + stride * max_count <= end) {
     for (int i = 0; i < max_count; i++, block += stride) {
       const auto input = hw::LoadU(tag, block);
-      const auto match = input == mask;
+      // TODO(floitsch): use an operator for the comparison when it is available
+      // on RISC-V.
+      const auto match = hw::Eq(input, mask);
       // Lanes with matches have all bits set, so we subtract to increase the
       // count by 1.
       submatches = hw::Sub(submatches, hw::VecFromMask(tag, match));
@@ -2224,7 +2226,9 @@ inline void RegExpMatchGlobalAtom_OneCharPattern(
   DCHECK_LT(end - block, stride * max_count);
   for (; block + stride <= end; block += stride) {
     const auto input = hw::LoadU(tag, block);
-    const auto match = input == mask;
+    // TODO(floitsch): use an operator for the comparison when it is available
+    // on RISC-V.
+    const auto match = hw::Eq(input, mask);
     submatches = hw::Sub(submatches, hw::VecFromMask(tag, match));
     if (!hw::AllFalse(tag, match)) {
       last_match_block = block;

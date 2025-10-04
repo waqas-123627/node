@@ -327,9 +327,15 @@ class HeapObject : public TaggedImpl<HeapObjectReferenceType::STRONG, Address> {
   inline void InitExternalPointerField(
       size_t offset, IsolateForSandbox isolate, Address value,
       WriteBarrierMode mode = UPDATE_WRITE_BARRIER);
+  inline void InitExternalPointerField(
+      size_t offset, IsolateForSandbox isolate, ExternalPointerTag tag,
+      Address value, WriteBarrierMode mode = UPDATE_WRITE_BARRIER);
   template <ExternalPointerTagRange tag_range>
   inline Address ReadExternalPointerField(size_t offset,
                                           IsolateForSandbox isolate) const;
+  inline Address ReadExternalPointerField(
+      size_t offset, IsolateForSandbox isolate,
+      ExternalPointerTagRange tag_range) const;
   // Similar to `ReadExternalPointerField()` but uses the CppHeapPointerTable.
   template <CppHeapPointerTag lower_bound, CppHeapPointerTag upper_bound>
   inline Address ReadCppHeapPointerField(
@@ -341,6 +347,9 @@ class HeapObject : public TaggedImpl<HeapObjectReferenceType::STRONG, Address> {
   inline void WriteExternalPointerField(size_t offset,
                                         IsolateForSandbox isolate,
                                         Address value);
+  inline void WriteExternalPointerField(size_t offset,
+                                        IsolateForSandbox isolate,
+                                        ExternalPointerTag tag, Address value);
 
   // Set up a lazily-initialized external pointer field. If the sandbox is
   // enabled, this will set the field to the kNullExternalPointerHandle. It will
@@ -689,7 +698,7 @@ STRUCT_LIST(DECL_STRUCT_PREDICATE)
 
 // Whether the object is located outside of the sandbox or in read-only
 // space. Currently only needed due to Code objects. Once they are fully
-// migrated into trusted space, this can be replaced by !InsideSandbox().
+// migrated into trusted space, this can be replaced by OutsideSandbox().
 static_assert(!kAllCodeObjectsLiveInTrustedSpace);
 V8_INLINE bool OutsideSandboxOrInReadonlySpace(Tagged<HeapObject> obj);
 

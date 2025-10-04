@@ -258,7 +258,9 @@ void Int32Multiply::GenerateCode(MaglevAssembler* masm,
 
   // TODO(leszeks): peephole optimise multiplication by a constant.
   __ MulS32(out, left, right);
-  __ LoadS32(out, out);
+
+  // Making sure that the 32-bit output is zero-extended.
+  __ LoadU32(out, out);
 }
 
 void Int32MultiplyOverflownBits::SetValueLocationConstraints() {
@@ -274,6 +276,7 @@ void Int32MultiplyOverflownBits::GenerateCode(MaglevAssembler* masm,
   Register out = ToRegister(result());
 
   // TODO(leszeks): peephole optimise multiplication by a constant.
+  // Making sure that the 32-bit output is zero-extended.
   __ MulHighS32(out, left, right);
 }
 
@@ -385,15 +388,18 @@ void Int32MultiplyWithOverflow::GenerateCode(MaglevAssembler* masm,
   }
   __ Or(temp, left, right);
   __ MulS32(out, left, right);
-  __ LoadS32(out, out);
   if (!CpuFeatures::IsSupported(MISC_INSTR_EXT2)) {
     // Test whether {high} is a sign-extension of {result}.
+    __ LoadS32(out, out);
     __ CmpU64(r0, out);
     cond = ne;
   }
   DCHECK_REGLIST_EMPTY(RegList{temp, out} &
                        GetGeneralRegistersUsedAsInputs(eager_deopt_info()));
   __ EmitEagerDeoptIf(cond, DeoptimizeReason::kOverflow, this);
+
+  // Making sure that the 32-bit output is zero-extended.
+  __ LoadU32(out, out);
 
   // If the result is zero, check if either lhs or rhs is negative.
   Label end;
@@ -868,6 +874,20 @@ void HoleyFloat64ToMaybeNanFloat64::GenerateCode(MaglevAssembler* masm,
   __ SubF64(value, value, kDoubleRegZero);
 }
 
+void Float64ToHoleyFloat64::SetValueLocationConstraints() {
+  UseRegister(input());
+  DefineSameAsFirst(this);
+}
+void Float64ToHoleyFloat64::GenerateCode(MaglevAssembler* masm,
+                                         const ProcessingState& state) {
+  DoubleRegister value = ToDoubleRegister(input());
+  // A Float64 value could contain a NaN with the bit pattern that has a special
+  // interpretation in the HoleyFloat64 representation, so we need to canicalize
+  // those before changing representation.
+  __ lzdr(kDoubleRegZero);
+  __ SubF64(value, value, kDoubleRegZero);
+}
+
 namespace {
 
 enum class ReduceInterruptBudgetType { kLoop, kReturn };
@@ -875,6 +895,11 @@ enum class ReduceInterruptBudgetType { kLoop, kReturn };
 void HandleInterruptsAndTiering(MaglevAssembler* masm, ZoneLabelRef done,
                                 Node* node, ReduceInterruptBudgetType type,
                                 Register scratch0) {
+  if (v8_flags.verify_write_barriers) {
+    // The safepoint/interrupt might trigger GC.
+    __ ResetLastYoungAllocation();
+  }
+
   // For loops, first check for interrupts. Don't do this for returns, as we
   // can't lazy deopt to the end of a return.
   if (type == ReduceInterruptBudgetType::kLoop) {

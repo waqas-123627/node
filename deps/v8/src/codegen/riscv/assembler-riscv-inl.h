@@ -56,8 +56,22 @@ namespace internal {
 bool CpuFeatures::SupportsOptimizer() { return IsSupported(FPU); }
 
 void Assembler::CheckBuffer() {
-  if (buffer_space() <= kGap) {
+  if (V8_UNLIKELY(buffer_space() <= kGap)) {
     GrowBuffer();
+  }
+}
+
+void Assembler::CheckTrampolinePoolQuick(int margin) {
+  DEBUG_PRINTF("\tCheckTrampolinePoolQuick pc_offset:%d %d\n", pc_offset(),
+               trampoline_check_ - margin);
+  if (V8_UNLIKELY(pc_offset() >= trampoline_check_ - margin)) {
+    CheckTrampolinePool();
+  }
+}
+
+void Assembler::DisassembleInstruction(uint8_t* pc) {
+  if (V8_UNLIKELY(v8_flags.riscv_debug)) {
+    DisassembleInstructionHelper(pc);
   }
 }
 
@@ -422,12 +436,14 @@ void Assembler::set_uint32_constant_at(Address pc, Address constant_pool,
 }
 
 [[nodiscard]] static inline Instr SetLo12Offset(int32_t lo12, Instr instr) {
-  DCHECK(Assembler::IsJalr(instr) || Assembler::IsAddi(instr));
+  DCHECK(Assembler::IsJalr(instr) || Assembler::IsAddi(instr) ||
+         Assembler::IsLoadWord(instr));
   DCHECK(is_int12(lo12));
   instr &= ~kImm12Mask;
   int32_t imm12 = lo12 << kImm12Shift;
   DCHECK(Assembler::IsJalr(instr | (imm12 & kImm12Mask)) ||
-         Assembler::IsAddi(instr | (imm12 & kImm12Mask)));
+         Assembler::IsAddi(instr | (imm12 & kImm12Mask)) ||
+         Assembler::IsLoadWord(instr | (imm12 & kImm12Mask)));
   return instr | (imm12 & kImm12Mask);
 }
 

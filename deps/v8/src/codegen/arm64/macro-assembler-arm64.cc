@@ -2670,14 +2670,20 @@ void MacroAssembler::JumpJSFunction(Register function_object,
 void MacroAssembler::ResolveWasmCodePointer(Register target,
                                             uint64_t signature_hash) {
   ASM_CODE_COMMENT(this);
-  ExternalReference global_jump_table =
-      ExternalReference::wasm_code_pointer_table();
   UseScratchRegisterScope temps(this);
   Register scratch = temps.AcquireX();
-  Mov(scratch, global_jump_table);
+  Mov(scratch, ExternalReference::wasm_code_pointer_table());
 #ifdef V8_ENABLE_SANDBOX
-  static_assert(sizeof(wasm::WasmCodePointerTableEntry) == 16);
-  Add(target, scratch, Operand(target, LSL, 4));
+  static constexpr int kNumRelevantBits = base::bits::WhichPowerOfTwo(
+      wasm::WasmCodePointerTable::kMaxWasmCodePointers);
+  static constexpr int kLeftShift =
+      base::bits::WhichPowerOfTwo(sizeof(wasm::WasmCodePointerTableEntry));
+
+  // Keep `kNumRelevantBits` bits, shifted by `kLeftShift`.
+  Ubfiz(target.W(), target.W(), kLeftShift, kNumRelevantBits);
+
+  Add(target, scratch, target);
+
   Ldr(scratch,
       MemOperand(target, wasm::WasmCodePointerTable::kOffsetOfSignatureHash));
   bool has_second_tmp = temps.CanAcquire();
@@ -2711,15 +2717,20 @@ void MacroAssembler::CallWasmCodePointer(Register target,
 }
 
 void MacroAssembler::CallWasmCodePointerNoSignatureCheck(Register target) {
-  ExternalReference global_jump_table =
-      ExternalReference::wasm_code_pointer_table();
+  ASM_CODE_COMMENT(this);
   UseScratchRegisterScope temps(this);
   Register scratch = temps.AcquireX();
-  Mov(scratch, global_jump_table);
-  constexpr unsigned int kEntrySizeLog2 =
-      std::bit_width(sizeof(wasm::WasmCodePointerTableEntry)) - 1;
-  Add(target, scratch, Operand(target, LSL, kEntrySizeLog2));
-  Ldr(target, MemOperand(target));
+  Mov(scratch, ExternalReference::wasm_code_pointer_table());
+
+  static constexpr int kNumRelevantBits = base::bits::WhichPowerOfTwo(
+      wasm::WasmCodePointerTable::kMaxWasmCodePointers);
+  static constexpr int kLeftShift =
+      base::bits::WhichPowerOfTwo(sizeof(wasm::WasmCodePointerTableEntry));
+
+  // Keep `kNumRelevantBits` bits, shifted by `kLeftShift`.
+  Ubfiz(target.W(), target.W(), kLeftShift, kNumRelevantBits);
+
+  Ldr(target, MemOperand(scratch, target));
 
   Call(target);
 }
@@ -3895,6 +3906,70 @@ void MacroAssembler::JumpIfNotMarking(Label* not_marking,
   Cbz(scratch, not_marking);
 }
 
+void MacroAssembler::PreCheckSkippedWriteBarrier(Register object,
+                                                 Register value,
+                                                 Register scratch, Label* ok) {
+  ASM_CODE_COMMENT(this);
+  DCHECK(!AreAliased(object, scratch));
+  DCHECK(!AreAliased(value, scratch));
+
+  // The most common case: Static write barrier elimination is allowed on the
+  // last young allocation.
+  {
+    UseScratchRegisterScope temps(this);
+    Register scratch1 = temps.AcquireX();
+    sub(scratch, object, kHeapObjectTag);
+    Ldr(scratch1,
+        MemOperand(kRootRegister, IsolateData::last_young_allocation_offset()));
+    cmp(scratch, scratch1);
+    B(Condition::kEqual, ok);
+  }
+
+  // Write barier can also be removed if value is in read-only space.
+  CheckPageFlag(value, scratch, MemoryChunk::kIsInReadOnlyHeapMask, ne, ok);
+
+  Label not_ok;
+
+  // Handle allocation folding, allow WB removal if:
+  //   LAB start <= last_young_allocation_ < (object address+1) < LAB top
+  // Note that object has tag bit set, so object == object address+1.
+
+  {
+    UseScratchRegisterScope temps(this);
+    Register scratch1 = temps.AcquireX();
+
+    // Check LAB start <= last_young_allocation_.
+    ldr(scratch, MemOperand(kRootRegister,
+                            IsolateData::new_allocation_info_start_offset()));
+    ldr(scratch1,
+        MemOperand(kRootRegister, IsolateData::last_young_allocation_offset()));
+    cmp(scratch, scratch1);
+    B(Condition::kUnsignedGreaterThan, &not_ok);
+
+    // Check last_young_allocation_ < (object address+1).
+    cmp(scratch1, object);
+    B(Condition::kUnsignedGreaterThanEqual, &not_ok);
+
+    // Check (object address+1) < LAB top.
+    ldr(scratch, MemOperand(kRootRegister,
+                            IsolateData::new_allocation_info_top_offset()));
+    cmp(object, scratch);
+    B(Condition::kUnsignedLessThan, ok);
+  }
+
+  // Slow path: Potentially check more cases in C++.
+  bind(&not_ok);
+}
+
+void MacroAssembler::MaybeJumpIfReadOnlyOrSmallSmi(Register value,
+                                                   Label* dest) {
+#if V8_STATIC_ROOTS_BOOL
+  // Quick check for Read-only and small Smi values.
+  static_assert(StaticReadOnlyRoot::kLastAllocatedRoot < kRegularPageSize);
+  JumpIfUnsignedLessThan(value, kRegularPageSize, dest);
+#endif  // V8_STATIC_ROOTS_BOOL
+}
+
 void MacroAssembler::RecordWriteField(
     Register object, int offset, Register value, LinkRegisterStatus lr_status,
     SaveFPRegsMode save_fp, SmiCheck smi_check, ReadOnlyCheck ro_check,
@@ -3905,13 +3980,9 @@ void MacroAssembler::RecordWriteField(
   // catch stores of Smis and read-only objects.
   Label done;
 
-#if V8_STATIC_ROOTS_BOOL
   if (ro_check == ReadOnlyCheck::kInline) {
-    // Quick check for Read-only and small Smi values.
-    static_assert(StaticReadOnlyRoot::kLastAllocatedRoot < kRegularPageSize);
-    JumpIfUnsignedLessThan(value, kRegularPageSize, &done);
+    MaybeJumpIfReadOnlyOrSmallSmi(value, &done);
   }
-#endif  // V8_STATIC_ROOTS_BOOL
 
   // Skip the barrier if writing a smi.
   if (smi_check == SmiCheck::kInline) {
@@ -4398,6 +4469,38 @@ void MacroAssembler::CallRecordWriteStub(Register object, Register slot_address,
   }
 }
 
+void MacroAssembler::CallVerifySkippedWriteBarrierStubSaveRegisters(
+    Register object, Register value, SaveFPRegsMode fp_mode) {
+  ASM_CODE_COMMENT(this);
+  PushCallerSaved(fp_mode);
+  CallVerifySkippedWriteBarrierStub(object, value);
+  PopCallerSaved(fp_mode);
+}
+
+void MacroAssembler::CallVerifySkippedWriteBarrierStub(Register object,
+                                                       Register value) {
+  ASM_CODE_COMMENT(this);
+  MovePair(kCArgRegs[0], object, kCArgRegs[1], value);
+  CallCFunction(ExternalReference::verify_skipped_write_barrier(), 2,
+                SetIsolateDataSlots::kNo);
+}
+
+void MacroAssembler::CallVerifySkippedIndirectWriteBarrierStubSaveRegisters(
+    Register object, Register value, SaveFPRegsMode fp_mode) {
+  ASM_CODE_COMMENT(this);
+  PushCallerSaved(fp_mode);
+  CallVerifySkippedIndirectWriteBarrierStub(object, value);
+  PopCallerSaved(fp_mode);
+}
+
+void MacroAssembler::CallVerifySkippedIndirectWriteBarrierStub(Register object,
+                                                               Register value) {
+  ASM_CODE_COMMENT(this);
+  MovePair(kCArgRegs[0], object, kCArgRegs[1], value);
+  CallCFunction(ExternalReference::verify_skipped_indirect_write_barrier(), 2,
+                SetIsolateDataSlots::kNo);
+}
+
 void MacroAssembler::MoveObjectAndSlot(Register dst_object, Register dst_slot,
                                        Register object, Operand offset) {
   ASM_CODE_COMMENT(this);
@@ -4470,13 +4573,9 @@ void MacroAssembler::RecordWrite(Register object, Operand offset,
   // young generation.
   Label done;
 
-#if V8_STATIC_ROOTS_BOOL
   if (ro_check == ReadOnlyCheck::kInline) {
-    // Quick check for Read-only and small Smi values.
-    static_assert(StaticReadOnlyRoot::kLastAllocatedRoot < kRegularPageSize);
-    JumpIfUnsignedLessThan(value, kRegularPageSize, &done);
+    MaybeJumpIfReadOnlyOrSmallSmi(value, &done);
   }
-#endif  // V8_STATIC_ROOTS_BOOL
 
   if (smi_check == SmiCheck::kInline) {
     DCHECK_EQ(0, kSmiTag);

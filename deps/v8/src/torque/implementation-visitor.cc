@@ -686,16 +686,13 @@ void ImplementationVisitor::Visit(Builtin* builtin) {
                        << " = "
                           "UncheckedParameter<JSDispatchHandleT>(Descriptor::"
                           "kJSDispatchHandle);\n";
-        } else if (V8_ENABLE_LEAPTIERING_BOOL) {
+        } else {
           csa_ccfile() << "  TNode<JSDispatchHandleT> " << generated_name
                        << " = "
                           "ReinterpretCast<JSDispatchHandleT>("
                           "LoadJSFunctionDispatchHandle("
                           "UncheckedParameter<JSFunction>("
                        << "Descriptor::kJSTarget)));\n";
-        } else {
-          csa_ccfile() << "  TNode<JSDispatchHandleT> " << generated_name
-                       << " = InvalidDispatchHandleConstant();\n";
         }
         csa_ccfile() << "  USE(" << generated_name << ");\n";
         expected_types = {TypeOracle::GetDispatchHandleType()};
@@ -2561,11 +2558,11 @@ VisitResult ImplementationVisitor::GenerateFetchFromLocation(
     const Type* referenced_type = *reference.ReferencedType();
     if (referenced_type == TypeOracle::GetFloat64OrUndefinedOrHoleType()) {
       return GenerateCall(QualifiedName({TORQUE_INTERNAL_NAMESPACE_STRING},
-#ifdef V8_ENABLE_EXPERIMENTAL_UNDEFINED_DOUBLE
+#ifdef V8_ENABLE_UNDEFINED_DOUBLE
                                         "LoadFloat64OrUndefinedOrHole"
 #else
                                         "LoadFloat64OrHole"
-#endif  // V8_ENABLE_EXPERIMENTAL_UNDEFINED_DOUBLE
+#endif  // V8_ENABLE_UNDEFINED_DOUBLE
                                         ),
                           Arguments{{reference.heap_reference()}, {}});
     } else if (auto struct_type = referenced_type->StructSupertype()) {
@@ -2631,11 +2628,11 @@ void ImplementationVisitor::GenerateAssignToLocation(
     if (referenced_type == TypeOracle::GetFloat64OrUndefinedOrHoleType()) {
       GenerateCall(
           QualifiedName({TORQUE_INTERNAL_NAMESPACE_STRING},
-#ifdef V8_ENABLE_EXPERIMENTAL_UNDEFINED_DOUBLE
+#ifdef V8_ENABLE_UNDEFINED_DOUBLE
                         "StoreFloat64OrUndefinedOrHole"
 #else
                         "StoreFloat64OrHole"
-#endif  // V8_ENABLE_EXPERIMENTAL_UNDEFINED_DOUBLE
+#endif  // V8_ENABLE_UNDEFINED_DOUBLE
                         ),
           Arguments{{reference.heap_reference(), assignment_value}, {}});
     } else if (auto struct_type = referenced_type->StructSupertype()) {

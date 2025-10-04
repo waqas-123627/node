@@ -529,9 +529,10 @@ macro JSToWasmWrapperHelper(
     }
   }
 
-  const sig = functionData.sig;
+  const internalFunction = functionData.internal;
+  const sig = internalFunction.sig;
   const implicitArg: WasmImportData|WasmTrustedInstanceData =
-      functionData.internal.implicit_arg;
+      internalFunction.implicit_arg;
 
   const paramCount = *GetRefAt<intptr>(sig, kWasmParameterCountOffset);
 
@@ -720,7 +721,7 @@ macro JSToWasmWrapperHelper(
       // undefined double experiment. In order to silence these false positives,
       // we temporarily fall back to the old pattern. This should be removed
       // when the feature is shipped.
-      @if(V8_ENABLE_EXPERIMENTAL_UNDEFINED_DOUBLE) {
+      @if(V8_ENABLE_UNDEFINED_DOUBLE) {
         if (param == Undefined) {
           *RefCast<float64>(toRef) = kCppQuietNaN;
         }

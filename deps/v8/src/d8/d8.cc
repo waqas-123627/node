@@ -36,6 +36,7 @@
 #include "src/api/api-inl.h"
 #include "src/base/cpu.h"
 #include "src/base/fpu.h"
+#include "src/base/hashing.h"
 #include "src/base/logging.h"
 #include "src/base/platform/memory.h"
 #include "src/base/platform/platform.h"
@@ -118,6 +119,8 @@
 #if V8_ENABLE_WEBASSEMBLY
 #include "src/trap-handler/trap-handler.h"
 #include "src/wasm/wasm-code-manager.h"
+#include "src/wasm/wasm-engine.h"
+#include "src/wasm/wasm-result.h"
 #include "src/wasm/wasm-serialization.h"
 #endif  // V8_ENABLE_WEBASSEMBLY
 
@@ -558,6 +561,11 @@ base::LazyMutex Shell::cached_code_mutex_;
 std::map<std::string, std::unique_ptr<ScriptCompiler::CachedData>>
     Shell::cached_code_map_;
 std::atomic<int> Shell::unhandled_promise_rejections_{0};
+
+#if V8_ENABLE_WEBASSEMBLY
+base::LazyMutex Shell::wasm_serialized_bytes_mutex_;
+std::unordered_set<size_t> Shell::wasm_serialized_bytes_hashes_;
+#endif  // V8_ENABLE_WEBASSEMBLY
 
 Global<Context> Shell::evaluation_context_;
 ArrayBuffer::Allocator* Shell::array_buffer_allocator;
@@ -1668,11 +1676,13 @@ Maybe<bool> ChainDynamicImportPromise(Isolate* isolate, Local<Context> realm,
 }
 }  // namespace
 
-void Shell::DoHostImportModuleDynamically(void* import_data) {
-  DynamicImportData* import_data_ =
-      static_cast<DynamicImportData*>(import_data);
+void Shell::DoHostImportModuleDynamically(void* data) {
+  Isolate* current_isolate = reinterpret_cast<Isolate*>(i::Isolate::Current());
+  DynamicImportData* import_data =
+      PerIsolateData::Get(current_isolate)->LookupImportData(data);
+  CHECK_EQ(current_isolate, import_data->isolate);
 
-  Isolate* isolate(import_data_->isolate);
+  Isolate* isolate(import_data->isolate);
   Global<Context> global_realm;
   Global<Promise::Resolver> global_resolver;
   Global<Promise> global_result_promise;
@@ -1683,19 +1693,18 @@ void Shell::DoHostImportModuleDynamically(void* import_data) {
 
   {
     HandleScope handle_scope(isolate);
-    Local<Context> realm = import_data_->context.Get(isolate);
-    Local<Value> referrer = import_data_->referrer.Get(isolate);
-    Local<String> v8_specifier = import_data_->specifier.Get(isolate);
-    ModuleImportPhase phase = import_data_->phase;
+    Local<Context> realm = import_data->context.Get(isolate);
+    Local<Value> referrer = import_data->referrer.Get(isolate);
+    Local<String> v8_specifier = import_data->specifier.Get(isolate);
+    ModuleImportPhase phase = import_data->phase;
     Local<FixedArray> import_attributes =
-        import_data_->import_attributes.Get(isolate);
-    Local<Promise::Resolver> resolver = import_data_->resolver.Get(isolate);
+        import_data->import_attributes.Get(isolate);
+    Local<Promise::Resolver> resolver = import_data->resolver.Get(isolate);
 
     global_realm.Reset(isolate, realm);
     global_resolver.Reset(isolate, resolver);
 
-    PerIsolateData* data = PerIsolateData::Get(isolate);
-    data->DeleteDynamicImportData(import_data_);
+    PerIsolateData::Get(isolate)->DeleteDynamicImportData(import_data);
 
     Context::Scope context_scope(realm);
     std::string specifier = ToSTLString(isolate, v8_specifier);
@@ -1960,11 +1969,9 @@ PerIsolateData::~PerIsolateData() {
   if (i::v8_flags.expose_async_hooks) {
     delete async_hooks_wrapper_;  // This uses the isolate
   }
-#if defined(LEAK_SANITIZER)
   for (DynamicImportData* data : import_data_) {
     delete data;
   }
-#endif
 }
 
 void PerIsolateData::RemoveUnhandledPromise(Local<Promise> promise) {
@@ -2010,15 +2017,18 @@ int PerIsolateData::HandleUnhandledPromiseRejections() {
 }
 
 void PerIsolateData::AddDynamicImportData(DynamicImportData* data) {
-#if defined(LEAK_SANITIZER)
+  SBXCHECK_EQ(import_data_.end(), import_data_.find(data));
   import_data_.insert(data);
-#endif
 }
 void PerIsolateData::DeleteDynamicImportData(DynamicImportData* data) {
-#if defined(LEAK_SANITIZER)
+  SBXCHECK_NE(import_data_.end(), import_data_.find(data));
   import_data_.erase(data);
-#endif
   delete data;
+}
+DynamicImportData* PerIsolateData::LookupImportData(void* data) {
+  auto* result = static_cast<DynamicImportData*>(data);
+  SBXCHECK_NE(import_data_.end(), import_data_.find(result));
+  return result;
 }
 
 Local<FunctionTemplate> PerIsolateData::GetTestApiObjectCtor() const {
@@ -2798,12 +2808,6 @@ void Shell::InstallConditionalFeatures(
   isolate->InstallConditionalFeatures(isolate->GetCurrentContext());
 }
 
-void Shell::EnableJSPI(const v8::FunctionCallbackInfo<v8::Value>& info) {
-  Isolate* isolate = info.GetIsolate();
-  isolate->SetWasmJSPIEnabledCallback([](auto) { return true; });
-  isolate->InstallConditionalFeatures(isolate->GetCurrentContext());
-}
-
 void Shell::SetFlushDenormals(const v8::FunctionCallbackInfo<v8::Value>& info) {
   Isolate* isolate = info.GetIsolate();
   if (i::v8_flags.correctness_fuzzer_suppressions || i::v8_flags.fuzzing) {
@@ -2951,6 +2955,7 @@ void Shell::WasmSerializeModule(
     ThrowError(isolate, "First argument must be a WasmModuleObject");
     return;
   }
+
   i::DirectHandle<i::WasmModuleObject> module_obj =
       i::Cast<i::WasmModuleObject>(Utils::OpenHandle(*info[0]));
 
@@ -2958,20 +2963,48 @@ void Shell::WasmSerializeModule(
   DCHECK(!native_module->compilation_state()->failed());
 
   i::wasm::WasmSerializer wasm_serializer(native_module);
-  size_t byte_length = wasm_serializer.GetSerializedNativeModuleSize();
+
+  // The content of the serialized byte buffer is nondeterministic (depends
+  // e.g. on timing, but also on the platform and on enabled features).
+  // Thus, return an empty array for correctness fuzzing.
+  size_t byte_length = i::v8_flags.correctness_fuzzer_suppressions
+                           ? 0
+                           : wasm_serializer.GetSerializedNativeModuleSize();
 
   Local<ArrayBuffer> array_buffer = ArrayBuffer::New(isolate, byte_length);
 
-  bool serialized_successfully = wasm_serializer.SerializeNativeModule(
-      {static_cast<uint8_t*>(array_buffer->GetBackingStore()->Data()),
-       byte_length});
-  CHECK(serialized_successfully || i::v8_flags.fuzzing);
+  base::Vector<uint8_t> byte_buffer{
+      static_cast<uint8_t*>(array_buffer->GetBackingStore()->Data()),
+      byte_length};
+  if (!i::v8_flags.correctness_fuzzer_suppressions &&
+      !wasm_serializer.SerializeNativeModule(byte_buffer)) {
+    CHECK(i::v8_flags.fuzzing);
+    return;
+  }
+
+  // Remember a hash of the serialized bytes. This will be used to check that
+  // only serialized bytes are accepted when deserializing.
+  {
+    size_t hash = base::Hasher{}
+                      .AddRange(native_module->wire_bytes())
+                      .AddRange(byte_buffer)
+                      .hash();
+    base::MutexGuard mutex_guard(Shell::wasm_serialized_bytes_mutex_.Pointer());
+    Shell::wasm_serialized_bytes_hashes_.insert(hash);
+  }
+
   info.GetReturnValue().Set(array_buffer);
 }
 
 void Shell::WasmDeserializeModule(
     const v8::FunctionCallbackInfo<v8::Value>& info) {
   Isolate* isolate = info.GetIsolate();
+  static std::atomic<bool> print_warning{true};
+  if (print_warning.exchange(false, std::memory_order_relaxed)) {
+    i::PrintF(
+        "NOTE: d8.wasm.deserializeModule() is not safe against manipulated "
+        "input. It's not VRP eligible.\n");
+  }
   i::Isolate* i_isolate = reinterpret_cast<i::Isolate*>(isolate);
   HandleScope handle_scope(isolate);
   if (!info[0]->IsArrayBuffer()) {
@@ -3005,17 +3038,46 @@ void Shell::WasmDeserializeModule(
       reinterpret_cast<uint8_t*>(buffer->backing_store()),
       buffer->byte_length()};
 
-  // Note that {wasm::DeserializeNativeModule} will allocate. We assume the
-  // JSArrayBuffer backing store doesn't get relocated.
-  i::wasm::CompileTimeImports compile_imports{};
-  i::MaybeDirectHandle<i::WasmModuleObject> maybe_module_object =
-      i::wasm::DeserializeNativeModule(i_isolate, buffer_vec, wire_bytes_vec,
-                                       compile_imports, {});
-  i::DirectHandle<i::WasmModuleObject> module_object;
-  if (!maybe_module_object.ToHandle(&module_object)) {
-    info.GetReturnValue().Set(Undefined(isolate));
-    return;
+  // Check that we only try to deserialize bytes that we previously produced via
+  // serialization.
+  // This is prone to hash collisions, but this check sufficiently prevents
+  // fuzzers from passing manipulated bytes (or bytes that do not match the wire
+  // bytes) in regular fuzzing.
+  {
+    size_t hash =
+        base::Hasher{}.AddRange(wire_bytes_vec).AddRange(buffer_vec).hash();
+    base::MutexGuard mutex_guard(Shell::wasm_serialized_bytes_mutex_.Pointer());
+    if (!Shell::wasm_serialized_bytes_hashes_.count(hash)) {
+      ThrowError(isolate, "Trying to deserialize manipulated bytes");
+      return;
+    }
   }
+
+  i::DirectHandle<i::WasmModuleObject> module_object;
+
+  // For correctness fuzzing, the `serializeModule` function always returns an
+  // empty buffer. We thus have to accept this empty buffer again here, and
+  // produce a valid module.
+  if (i::v8_flags.correctness_fuzzer_suppressions) {
+    CHECK(buffer_vec.empty());
+    i::wasm::ErrorThrower thrower{i_isolate, "d8.wasm.deserializeModule"};
+    module_object =
+        i::wasm::GetWasmEngine()
+            ->SyncCompile(i_isolate,
+                          i::wasm::WasmEnabledFeatures::FromIsolate(i_isolate),
+                          i::wasm::CompileTimeImports{}, &thrower,
+                          base::OwnedCopyOf(wire_bytes_vec))
+            .ToHandleChecked();
+    DCHECK(!thrower.error());
+  } else {
+    // Note that {wasm::DeserializeNativeModule} will allocate. We assume the
+    // JSArrayBuffer backing store doesn't get relocated.
+    module_object =
+        i::wasm::DeserializeNativeModule(i_isolate, buffer_vec, wire_bytes_vec,
+                                         i::wasm::CompileTimeImports{}, {})
+            .ToHandleChecked();
+  }
+
   info.GetReturnValue().Set(Utils::ToLocal(module_object));
 }
 
@@ -4353,11 +4415,6 @@ Local<ObjectTemplate> Shell::CreateD8Template(Isolate* isolate) {
         isolate, "installConditionalFeatures",
         FunctionTemplate::New(isolate, Shell::InstallConditionalFeatures));
 
-    // Enable JavaScript Promise Integration at runtime, to simulate
-    // Origin Trial behavior.
-    test_template->Set(isolate, "enableJSPI",
-                       FunctionTemplate::New(isolate, Shell::EnableJSPI));
-
     test_template->Set(
         isolate, "setFlushDenormals",
         FunctionTemplate::New(isolate, Shell::SetFlushDenormals));
@@ -5098,7 +5155,12 @@ void Shell::ReadBuffer(const v8::FunctionCallbackInfo<v8::Value>& info) {
 
   uint8_t* data = reinterpret_cast<uint8_t*>(ReadChars(*filename, &length));
   if (data == nullptr) {
-    ThrowError(isolate, "Error reading file");
+    std::ostringstream error_msg;
+    error_msg << "Error reading file \""
+              << std::string_view{*filename,
+                                  std::min(size_t{50}, filename.length())}
+              << (filename.length() > 50 ? "[...]" : "") << "\"";
+    ThrowError(isolate, error_msg.str());
     return;
   }
   Local<v8::ArrayBuffer> buffer = ArrayBuffer::New(isolate, length);
@@ -5332,7 +5394,8 @@ class InspectorClient : public v8_inspector::V8InspectorClient {
  private:
   static v8_inspector::V8InspectorSession* GetSession(Local<Context> context) {
     InspectorClient* inspector_client = static_cast<InspectorClient*>(
-        context->GetAlignedPointerFromEmbedderData(kInspectorClientIndex));
+        context->GetAlignedPointerFromEmbedderData(kInspectorClientIndex,
+                                                   kInspectorClientTag));
     return inspector_client->session_.get();
   }
 
@@ -5789,6 +5852,10 @@ void Worker::SetCurrentWorker(Worker* worker) {
   current_worker_ = worker;
 }
 
+namespace {
+constexpr v8::ExternalPointerTypeTag kWorkerTag = 82;
+}  // namespace
+
 // static
 Worker* Worker::GetCurrentWorker() { return current_worker_; }
 
@@ -5839,7 +5906,7 @@ void Worker::ExecuteInThread() {
           Context::Scope context_scope(context);
 
           Local<Object> global = context->Global();
-          Local<Value> this_value = External::New(isolate_, this);
+          Local<Value> this_value = External::New(isolate_, this, kWorkerTag);
 
           Local<FunctionTemplate> postmessage_fun_template =
               FunctionTemplate::New(isolate_, Worker::PostMessageOut,
@@ -5954,7 +6021,7 @@ void Worker::PostMessageOut(const v8::FunctionCallbackInfo<v8::Value>& info) {
   if (data) {
     DCHECK(info.Data()->IsExternal());
     Local<External> this_value = info.Data().As<External>();
-    Worker* worker = static_cast<Worker*>(this_value->Value());
+    Worker* worker = static_cast<Worker*>(this_value->Value(kWorkerTag));
 
     worker->out_queue_.Enqueue(std::move(data));
     worker->out_semaphore_.Signal();
@@ -5974,7 +6041,7 @@ void Worker::Close(const v8::FunctionCallbackInfo<v8::Value>& info) {
   HandleScope handle_scope(isolate);
   DCHECK(info.Data()->IsExternal());
   Local<External> this_value = info.Data().As<External>();
-  Worker* worker = static_cast<Worker*>(this_value->Value());
+  Worker* worker = static_cast<Worker*>(this_value->Value(kWorkerTag));
   worker->Terminate();
 }
 

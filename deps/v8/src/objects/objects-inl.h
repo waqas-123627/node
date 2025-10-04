@@ -499,7 +499,7 @@ constexpr bool FastInReadOnlySpaceOrSmallSmi(Tagged<MaybeObject> obj) {
 
 bool OutsideSandboxOrInReadonlySpace(Tagged<HeapObject> obj) {
 #ifdef V8_ENABLE_SANDBOX
-  return !InsideSandbox(obj.address()) ||
+  return OutsideSandbox(obj.address()) ||
          MemoryChunk::FromHeapObject(obj)->SandboxSafeInReadOnlySpace();
 #else
   return true;
@@ -874,11 +874,11 @@ ElementsKind Object::OptimalElementsKind(Tagged<Object> obj,
   // if (IsUninitializedHole(heap_object)) {
   //   return PACKED_SMI_ELEMENTS;
   // }
-#ifdef V8_ENABLE_EXPERIMENTAL_UNDEFINED_DOUBLE
+#ifdef V8_ENABLE_UNDEFINED_DOUBLE
   if (IsUndefined(heap_object, GetReadOnlyRoots())) {
     return HOLEY_DOUBLE_ELEMENTS;
   }
-#endif  // V8_ENABLE_EXPERIMENTAL_UNDEFINED_DOUBLE
+#endif  // V8_ENABLE_UNDEFINED_DOUBLE
   return PACKED_ELEMENTS;
 }
 
@@ -1089,10 +1089,26 @@ void HeapObject::InitExternalPointerField(size_t offset,
                                              tag, mode);
 }
 
+void HeapObject::InitExternalPointerField(size_t offset,
+                                          IsolateForSandbox isolate,
+                                          ExternalPointerTag tag, Address value,
+                                          WriteBarrierMode mode) {
+  i::InitExternalPointerField(address(), field_address(offset), isolate, tag,
+                              value);
+  CONDITIONAL_EXTERNAL_POINTER_WRITE_BARRIER(*this, static_cast<int>(offset),
+                                             tag, mode);
+}
+
 template <ExternalPointerTagRange tag_range>
 Address HeapObject::ReadExternalPointerField(size_t offset,
                                              IsolateForSandbox isolate) const {
   return i::ReadExternalPointerField<tag_range>(field_address(offset), isolate);
+}
+
+Address HeapObject::ReadExternalPointerField(
+    size_t offset, IsolateForSandbox isolate,
+    ExternalPointerTagRange tag_range) const {
+  return i::ReadExternalPointerField(field_address(offset), isolate, tag_range);
 }
 
 template <CppHeapPointerTag lower_bound, CppHeapPointerTag upper_bound>
@@ -1113,6 +1129,13 @@ void HeapObject::WriteExternalPointerField(size_t offset,
                                            IsolateForSandbox isolate,
                                            Address value) {
   i::WriteExternalPointerField<tag>(field_address(offset), isolate, value);
+}
+
+void HeapObject::WriteExternalPointerField(size_t offset,
+                                           IsolateForSandbox isolate,
+                                           ExternalPointerTag tag,
+                                           Address value) {
+  i::WriteExternalPointerField(field_address(offset), isolate, tag, value);
 }
 
 void HeapObject::SetupLazilyInitializedExternalPointerField(size_t offset) {
@@ -1307,7 +1330,6 @@ template <typename ObjectType>
 JSDispatchHandle HeapObject::AllocateAndInstallJSDispatchHandle(
     ObjectType host, size_t offset, Isolate* isolate, uint16_t parameter_count,
     DirectHandle<Code> code, WriteBarrierMode mode) {
-#ifdef V8_ENABLE_LEAPTIERING
   JSDispatchTable::Space* space =
       isolate->GetJSDispatchTableSpaceFor(host->field_address(offset));
   JSDispatchHandle handle =
@@ -1322,9 +1344,6 @@ JSDispatchHandle HeapObject::AllocateAndInstallJSDispatchHandle(
   CONDITIONAL_JS_DISPATCH_HANDLE_WRITE_BARRIER(*host, handle, mode);
 
   return handle;
-#else
-  UNREACHABLE();
-#endif  // V8_ENABLE_LEAPTIERING
 }
 
 ObjectSlot HeapObject::RawField(int byte_offset) const {

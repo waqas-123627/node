@@ -2291,7 +2291,8 @@ CodeAssemblerCompilationJob::CodeAssemblerCompilationJob(
       finalize_order_(finalize_order) {
   DCHECK(code_kind == CodeKind::BUILTIN ||
          code_kind == CodeKind::BYTECODE_HANDLER ||
-         code_kind == CodeKind::FOR_TESTING);
+         code_kind == CodeKind::FOR_TESTING ||
+         code_kind == CodeKind::FOR_TESTING_JS);
   compilation_info_.set_builtin(builtin);
 }
 
@@ -3040,7 +3041,8 @@ base::OwnedVector<uint8_t> SerializeInliningPositions(
 // static
 wasm::WasmCompilationResult Pipeline::GenerateWasmCode(
     wasm::CompilationEnv* env, WasmCompilationData& compilation_data,
-    wasm::WasmDetectedFeatures* detected, Counters* counters) {
+    wasm::WasmDetectedFeatures* detected,
+    DelayedCounterUpdates* counter_updates) {
   auto* wasm_engine = wasm::GetWasmEngine();
   const wasm::WasmModule* module = env->module;
   base::TimeTicks start_time;
@@ -3197,6 +3199,16 @@ wasm::WasmCompilationResult Pipeline::GenerateWasmCode(
 
   if (v8_flags.wasm_opt && uses_wasm_gc_features) {
     CHECK(turboshaft_pipeline.Run<turboshaft::WasmGCOptimizePhase>());
+  } else {
+    // `has_wasm_type_cast_rtt_in_loop` needs to be initialized before the
+    // WasmLoweringPhase. If we reach this point, then either wasm_opt is
+    // disabled in which case it makes sense to skip the optimization it
+    // controls, or the graph doesn't use WasmGC features, in which case this
+    // optimization won't apply anyways. By just calling
+    // `initialize_has_wasm_type_cast_rtt_in_loop` and never calling
+    // `set_has_wasm_type_cast_rtt_in_loop`, we effectively disable the
+    // wasm_type_cast_rtt_in_loop optimization.
+    turboshaft_data.initialize_has_wasm_type_cast_rtt_in_loop();
   }
 
   // TODO(mliedtke): This phase could be merged with the WasmGCOptimizePhase
@@ -3309,9 +3321,10 @@ wasm::WasmCompilationResult Pipeline::GenerateWasmCode(
                    << std::endl;
   }
 
-  if (counters && compilation_data.body_size() >= 100 * KB) {
+  if (compilation_data.body_size() >= 100 * KB) {
     size_t zone_bytes = zone_stats.GetMaxAllocatedBytes();
-    counters->wasm_compile_huge_function_peak_memory_bytes()->AddSample(
+    counter_updates->AddSample(
+        &Counters::wasm_compile_huge_function_peak_memory_bytes,
         static_cast<int>(std::min(size_t{kMaxInt}, zone_bytes)));
   }
 
@@ -3319,7 +3332,7 @@ wasm::WasmCompilationResult Pipeline::GenerateWasmCode(
   // any deopt data. This indicates a baseline of how many functions can
   // potentially deopt, so that the statistics of having x functions that
   // deopted at least once becomes more meaningful.
-  if (counters && !result.deopt_data.empty()) {
+  if (!result.deopt_data.empty()) {
     DCHECK(v8_flags.wasm_deopt);
     bool is_first_tierup = false;
     {
@@ -3329,7 +3342,7 @@ wasm::WasmCompilationResult Pipeline::GenerateWasmCode(
           compilation_data.func_index);
     }
     if (is_first_tierup) {
-      counters->wasm_deopts_per_function()->AddSample(0);
+      counter_updates->AddSample(&Counters::wasm_deopts_per_function, 0);
     }
   }
 

@@ -185,8 +185,6 @@
 
 namespace v8 {
 
-namespace {
-
 i::ExternalPointerTag ToExternalPointerTag(v8::EmbedderDataTypeTag api_tag) {
   uint16_t tag_value = static_cast<uint16_t>(i::kFirstEmbedderDataTag) +
                        static_cast<uint16_t>(api_tag);
@@ -194,16 +192,6 @@ i::ExternalPointerTag ToExternalPointerTag(v8::EmbedderDataTypeTag api_tag) {
                   "The provided tag is outside the allowed range");
   return static_cast<i::ExternalPointerTag>(tag_value);
 }
-
-v8::EmbedderDataTypeTag ToApiEmbedderDataTypeTag(i::ExternalPointerTag tag) {
-  DCHECK_GE(tag, i::kFirstEmbedderDataTag);
-  DCHECK_LE(tag, i::kLastEmbedderDataTag);
-  uint16_t tag_value = static_cast<uint16_t>(tag) -
-                       static_cast<uint16_t>(i::kFirstEmbedderDataTag);
-  return static_cast<v8::EmbedderDataTypeTag>(tag_value);
-}
-
-}  // namespace
 
 static OOMErrorCallback g_oom_error_callback = nullptr;
 
@@ -859,6 +847,10 @@ bool Data::IsFunctionTemplate() const {
   return i::IsFunctionTemplateInfo(*Utils::OpenDirectHandle(this));
 }
 
+bool Data::IsDictionaryTemplate() const {
+  return i::IsDictionaryTemplateInfo(*Utils::OpenDirectHandle(this));
+}
+
 bool Data::IsContext() const {
   return i::IsContext(*Utils::OpenDirectHandle(this));
 }
@@ -976,7 +968,8 @@ void Context::SetEmbedderData(int index, v8::Local<Value> value) {
             *Utils::OpenDirectHandle(*GetEmbedderData(index)));
 }
 
-void* Context::SlowGetAlignedPointerFromEmbedderData(int index) {
+void* Context::SlowGetAlignedPointerFromEmbedderData(int index,
+                                                     EmbedderDataTypeTag tag) {
   const char* location = "v8::Context::GetAlignedPointerFromEmbedderData()";
   i::Isolate* i_isolate = i::Isolate::Current();
   i::HandleScope handle_scope(i_isolate);
@@ -984,15 +977,11 @@ void* Context::SlowGetAlignedPointerFromEmbedderData(int index) {
       EmbedderDataFor(this, index, false, location);
   if (data.is_null()) return nullptr;
   void* result;
-  Utils::ApiCheck(i::EmbedderDataSlot(*data, index)
-                      .DeprecatedToAlignedPointer(i_isolate, &result),
-                  location, "Pointer is not aligned");
+  Utils::ApiCheck(
+      i::EmbedderDataSlot(*data, index)
+          .ToAlignedPointer(i_isolate, &result, ToExternalPointerTag(tag)),
+      location, "Pointer is not aligned");
   return result;
-}
-
-void Context::SetAlignedPointerInEmbedderData(int index, void* value) {
-  SetAlignedPointerInEmbedderData(
-      index, value, ToApiEmbedderDataTypeTag(i::kEmbedderDataSlotPayloadTag));
 }
 
 void Context::SetAlignedPointerInEmbedderData(int index, void* value,
@@ -1005,7 +994,7 @@ void Context::SetAlignedPointerInEmbedderData(int index, void* value,
                 .store_aligned_pointer(i_isolate, *data, value,
                                        ToExternalPointerTag(tag));
   Utils::ApiCheck(ok, location, "Pointer is not aligned");
-  DCHECK_EQ(value, GetAlignedPointerFromEmbedderData(index));
+  DCHECK_EQ(value, GetAlignedPointerFromEmbedderData(index, tag));
 }
 
 // --- T e m p l a t e ---
@@ -2266,14 +2255,34 @@ int Module::GetIdentityHash() const {
   return self->hash();
 }
 
+Maybe<bool> Module::InstantiateModule(
+    Local<Context> context, ResolveModuleByIndexCallback module_callback,
+    ResolveSourceByIndexCallback source_callback) {
+  auto i_isolate = i::Isolate::Current();
+  EnterV8Scope<> api_scope{i_isolate, context,
+                           RCCId::kAPI_Module_InstantiateModule};
+
+  i::Module::UserResolveCallbacks callbacks;
+  callbacks.module_callback_by_index = module_callback;
+  callbacks.source_callback_by_index = source_callback;
+  if (!i::Module::Instantiate(i_isolate, Utils::OpenHandle(this), context,
+                              callbacks)) {
+    return {};
+  }
+  return Just(true);
+}
+
 Maybe<bool> Module::InstantiateModule(Local<Context> context,
                                       ResolveModuleCallback module_callback,
                                       ResolveSourceCallback source_callback) {
   auto i_isolate = i::Isolate::Current();
   EnterV8Scope<> api_scope{i_isolate, context,
                            RCCId::kAPI_Module_InstantiateModule};
+  i::Module::UserResolveCallbacks callbacks;
+  callbacks.module_callback = module_callback;
+  callbacks.source_callback = source_callback;
   if (!i::Module::Instantiate(i_isolate, Utils::OpenHandle(this), context,
-                              module_callback, source_callback)) {
+                              callbacks)) {
     return {};
   }
   return Just(true);
@@ -2902,11 +2911,6 @@ Local<String> Message::Get() const {
   Local<String> result =
       Utils::ToLocal(i::MessageHandler::GetMessage(i_isolate, self));
   return scope.Escape(result);
-}
-
-v8::Isolate* Message::GetIsolate() const {
-  i::Isolate* i_isolate = i::Isolate::Current();
-  return reinterpret_cast<Isolate*>(i_isolate);
 }
 
 ScriptOrigin Message::GetScriptOrigin() const {
@@ -4641,13 +4645,6 @@ MaybeLocal<Value> v8::Object::GetOwnPropertyDescriptor(Local<Context> context,
   return api_scope.Escape(Utils::ToLocal(desc.ToObject(i_isolate)));
 }
 
-Local<Value> v8::Object::GetPrototype() {
-  auto self = Utils::OpenDirectHandle(this);
-  auto i_isolate = i::Isolate::Current();
-  i::PrototypeIterator iter(i_isolate, self);
-  return Utils::ToLocal(i::PrototypeIterator::GetCurrent(iter));
-}
-
 Local<Value> v8::Object::GetPrototypeV2() {
   auto self = Utils::OpenDirectHandle(this);
   auto i_isolate = i::Isolate::Current();
@@ -4700,12 +4697,6 @@ Maybe<bool> SetPrototypeImpl(v8::Object* this_, Local<Context> context,
 }
 
 }  // namespace
-
-Maybe<bool> v8::Object::SetPrototype(Local<Context> context,
-                                     Local<Value> value) {
-  static constexpr bool from_javascript = false;
-  return SetPrototypeImpl(this, context, value, from_javascript);
-}
 
 Maybe<bool> v8::Object::SetPrototypeV2(Local<Context> context,
                                        Local<Value> value) {
@@ -5173,7 +5164,8 @@ Local<v8::Context> v8::Object::GetCreationContextChecked() {
 namespace {
 V8_INLINE void* GetAlignedPointerFromEmbedderDataInCreationContextImpl(
     i::DirectHandle<i::JSReceiver> object,
-    i::IsolateForSandbox i_isolate_for_sandbox, int index) {
+    i::IsolateForSandbox i_isolate_for_sandbox, int index,
+    EmbedderDataTypeTag tag) {
   const char* location =
       "v8::Object::GetAlignedPointerFromEmbedderDataInCreationContext()";
   auto maybe_context = object->GetCreationContext();
@@ -5208,10 +5200,10 @@ V8_INLINE void* GetAlignedPointerFromEmbedderDataInCreationContextImpl(
   if (V8_LIKELY(static_cast<unsigned>(index) <
                 static_cast<unsigned>(data->length()))) {
     void* result;
-    Utils::ApiCheck(
-        i::EmbedderDataSlot(data, index)
-            .DeprecatedToAlignedPointer(i_isolate_for_sandbox, &result),
-        location, "Pointer is not aligned");
+    Utils::ApiCheck(i::EmbedderDataSlot(data, index)
+                        .ToAlignedPointer(i_isolate_for_sandbox, &result,
+                                          ToExternalPointerTag(tag)),
+                    location, "Pointer is not aligned");
     return result;
   }
   // Bad index, report an API error.
@@ -5223,19 +5215,19 @@ V8_INLINE void* GetAlignedPointerFromEmbedderDataInCreationContextImpl(
 }  // namespace
 
 void* v8::Object::GetAlignedPointerFromEmbedderDataInCreationContext(
-    v8::Isolate* isolate, int index) {
+    v8::Isolate* isolate, int index, EmbedderDataTypeTag tag) {
   auto self = Utils::OpenDirectHandle(this);
   auto i_isolate = reinterpret_cast<i::Isolate*>(isolate);
   return GetAlignedPointerFromEmbedderDataInCreationContextImpl(self, i_isolate,
-                                                                index);
+                                                                index, tag);
 }
 
 void* v8::Object::GetAlignedPointerFromEmbedderDataInCreationContext(
-    int index) {
+    int index, EmbedderDataTypeTag tag) {
   auto self = Utils::OpenDirectHandle(this);
   i::IsolateForSandbox isolate = i::GetCurrentIsolateForSandbox();
   return GetAlignedPointerFromEmbedderDataInCreationContextImpl(self, isolate,
-                                                                index);
+                                                                index, tag);
 }
 
 int v8::Object::GetIdentityHash() {
@@ -5933,7 +5925,6 @@ void String::WriteV2(Isolate* v8_isolate, uint32_t offset, uint32_t length,
 
 void String::WriteOneByteV2(Isolate* v8_isolate, uint32_t offset,
                             uint32_t length, uint8_t* buffer, int flags) const {
-  DCHECK(IsOneByte());
   WriteHelperV2(reinterpret_cast<i::Isolate*>(v8_isolate), this, buffer, offset,
                 length, flags);
 }
@@ -6260,34 +6251,30 @@ void v8::Object::SetInternalField(int index, v8::Local<Data> value) {
   i::Cast<i::JSObject>(obj)->SetEmbedderField(index, *val);
 }
 
-void* v8::Object::SlowGetAlignedPointerFromInternalField(v8::Isolate* isolate,
-                                                         int index) {
+void* v8::Object::SlowGetAlignedPointerFromInternalField(
+    v8::Isolate* isolate, int index, EmbedderDataTypeTag tag) {
   auto obj = Utils::OpenDirectHandle(this);
   const char* location = "v8::Object::GetAlignedPointerFromInternalField()";
   if (!InternalFieldOK(obj, index, location)) return nullptr;
   void* result;
   Utils::ApiCheck(i::EmbedderDataSlot(i::Cast<i::JSObject>(*obj), index)
-                      .DeprecatedToAlignedPointer(
-                          reinterpret_cast<i::Isolate*>(isolate), &result),
+                      .ToAlignedPointer(reinterpret_cast<i::Isolate*>(isolate),
+                                        &result, ToExternalPointerTag(tag)),
                   location, "Unaligned pointer");
   return result;
 }
 
-void* v8::Object::SlowGetAlignedPointerFromInternalField(int index) {
+void* v8::Object::SlowGetAlignedPointerFromInternalField(
+    int index, EmbedderDataTypeTag tag) {
   auto obj = Utils::OpenDirectHandle(this);
   const char* location = "v8::Object::GetAlignedPointerFromInternalField()";
   if (!InternalFieldOK(obj, index, location)) return nullptr;
   void* result;
-  Utils::ApiCheck(
-      i::EmbedderDataSlot(i::Cast<i::JSObject>(*obj), index)
-          .DeprecatedToAlignedPointer(i::Isolate::Current(), &result),
-      location, "Unaligned pointer");
+  Utils::ApiCheck(i::EmbedderDataSlot(i::Cast<i::JSObject>(*obj), index)
+                      .ToAlignedPointer(i::Isolate::Current(), &result,
+                                        ToExternalPointerTag(tag)),
+                  location, "Unaligned pointer");
   return result;
-}
-
-void v8::Object::SetAlignedPointerInInternalField(int index, void* value) {
-  SetAlignedPointerInInternalField(
-      index, value, ToApiEmbedderDataTypeTag(i::kEmbedderDataSlotPayloadTag));
 }
 
 void v8::Object::SetAlignedPointerInInternalField(int index, void* value,
@@ -6301,13 +6288,12 @@ void v8::Object::SetAlignedPointerInInternalField(int index, void* value,
                       .store_aligned_pointer(i::Isolate::Current(), *obj, value,
                                              ToExternalPointerTag(tag)),
                   location, "Unaligned pointer");
-  DCHECK_EQ(value, GetAlignedPointerFromInternalField(index));
+  DCHECK_EQ(value, GetAlignedPointerFromInternalField(index, tag));
 }
 
 void v8::Object::SetAlignedPointerInInternalFields(int argc, int indices[],
                                                    void* values[]) {
-  EmbedderDataTypeTag tag =
-      ToApiEmbedderDataTypeTag(i::kEmbedderDataSlotPayloadTag);
+  EmbedderDataTypeTag tag = kEmbedderDataTypeTagDefault;
 
   auto obj = Utils::OpenDirectHandle(this);
   if (!IsJSObject(*obj)) return;
@@ -6327,7 +6313,7 @@ void v8::Object::SetAlignedPointerInInternalFields(int argc, int indices[],
             .store_aligned_pointer(i::Isolate::Current(), *obj, value,
                                    ToExternalPointerTag(tag)),
         location, "Unaligned pointer");
-    DCHECK_EQ(value, GetAlignedPointerFromInternalField(index));
+    DCHECK_EQ(value, GetAlignedPointerFromInternalField(index, tag));
   }
 }
 
@@ -7212,8 +7198,6 @@ Maybe<void> Context::DeepFreeze(DeepFreezeDelegate* delegate) {
   return JustVoid();
 }
 
-v8::Isolate* Context::GetIsolate() { return Isolate::GetCurrent(); }
-
 v8::MicrotaskQueue* Context::GetMicrotaskQueue() {
   auto env = Utils::OpenDirectHandle(this);
   Utils::ApiCheck(i::IsNativeContext(*env), "v8::Context::GetMicrotaskQueue",
@@ -7512,7 +7496,8 @@ void FunctionTemplate::SealAndPrepareForPromotionToReadOnly() {
                                                                 self);
 }
 
-Local<External> v8::External::New(Isolate* v8_isolate, void* value) {
+Local<External> v8::External::New(Isolate* v8_isolate, void* value,
+                                  ExternalPointerTypeTag api_tag) {
   static_assert(sizeof(value) == sizeof(i::Address));
   // Nullptr is not allowed here because serialization/deserialization of
   // nullptr external api references is not possible as nullptr is used as an
@@ -7522,15 +7507,23 @@ Local<External> v8::External::New(Isolate* v8_isolate, void* value) {
   i::Isolate* i_isolate = reinterpret_cast<i::Isolate*>(v8_isolate);
   ApiRuntimeCallStatsScope rcs_scope(i_isolate, RCCId::kAPI_External_New);
   EnterV8NoScriptNoExceptionScope api_scope(i_isolate);
-  i::DirectHandle<i::JSObject> external =
-      i_isolate->factory()->NewExternal(value);
+  uint16_t tag_value = static_cast<uint16_t>(i::kFirstExternalTypeTag) +
+                       static_cast<uint16_t>(api_tag);
+  Utils::ApiCheck(tag_value <= i::kLastExternalTypeTag, "v8::External::New",
+                  "The provided tag is outside the allowed range");
+  i::DirectHandle<i::JSObject> external = i_isolate->factory()->NewExternal(
+      value, static_cast<i::ExternalPointerTag>(tag_value));
   return Utils::ExternalToLocal(external);
 }
 
-void* External::Value() const {
+void* External::Value(ExternalPointerTypeTag api_tag) const {
   i::IsolateForSandbox isolate = i::GetCurrentIsolateForSandbox();
+  uint16_t tag_value = static_cast<uint16_t>(i::kFirstExternalTypeTag) +
+                       static_cast<uint16_t>(api_tag);
+  Utils::ApiCheck(tag_value <= i::kLastExternalTypeTag, "v8::External::Value",
+                  "The provided tag is outside the allowed range");
   return i::Cast<i::JSExternalObject>(*Utils::OpenDirectHandle(this))
-      ->value(isolate);
+      ->value(isolate, static_cast<i::ExternalPointerTag>(tag_value));
 }
 
 Local<CppHeapExternal> v8::CppHeapExternal::NewImpl(Isolate* v8_isolate,
@@ -7803,11 +7796,6 @@ bool v8::String::StringEquals(Local<String> that) const {
   auto self = Utils::OpenDirectHandle(this);
   auto other = Utils::OpenDirectHandle(*that);
   return self->Equals(*other);
-}
-
-Isolate* v8::Object::GetIsolate() {
-  i::Isolate* i_isolate = i::Isolate::Current();
-  return reinterpret_cast<Isolate*>(i_isolate);
 }
 
 Local<v8::Object> v8::Object::New(Isolate* v8_isolate) {
@@ -8322,10 +8310,10 @@ FastIterateResult FastIterateArray(DirectHandle<JSArray> array,
         DirectHandle<Object> value;
         if (elements->is_the_hole(i)) {
           value = Handle<Object>(isolate->factory()->undefined_value());
-#ifdef V8_ENABLE_EXPERIMENTAL_UNDEFINED_DOUBLE
+#ifdef V8_ENABLE_UNDEFINED_DOUBLE
         } else if (elements->is_undefined(i)) {
           value = Handle<Object>(isolate->factory()->undefined_value());
-#endif  // V8_ENABLE_EXPERIMENTAL_UNDEFINED_DOUBLE
+#endif  // V8_ENABLE_UNDEFINED_DOUBLE
         } else {
           value = isolate->factory()->NewNumber(elements->get_scalar(i));
         }
@@ -9728,6 +9716,13 @@ int64_t Isolate::AdjustAmountOfExternalAllocatedMemoryImpl(
     return amount;
   }
 
+#if V8_VERIFY_WRITE_BARRIERS
+  // Incrementing the number of allocated bytes may trigger GC.
+  i_isolate->main_thread_local_heap()
+      ->allocator()
+      ->ResetMostRecentYoungAllocation();
+#endif
+
   if (amount > i_isolate->heap()->external_memory_limit_for_interrupt()) {
     HandleExternalMemoryInterrupt();
   }
@@ -10886,16 +10881,9 @@ CALLBACK_SETTER(WasmAsyncResolvePromiseCallback,
 CALLBACK_SETTER(WasmLoadSourceMapCallback, WasmLoadSourceMapCallback,
                 wasm_load_source_map_callback)
 
-CALLBACK_SETTER(WasmImportedStringsEnabledCallback,
-                WasmImportedStringsEnabledCallback,
-                wasm_imported_strings_enabled_callback)
-
 CALLBACK_SETTER(WasmCustomDescriptorsEnabledCallback,
                 WasmCustomDescriptorsEnabledCallback,
                 wasm_custom_descriptors_enabled_callback)
-
-CALLBACK_SETTER(WasmJSPIEnabledCallback, WasmJSPIEnabledCallback,
-                wasm_jspi_enabled_callback)
 
 CALLBACK_SETTER(SharedArrayBufferConstructorEnabledCallback,
                 SharedArrayBufferConstructorEnabledCallback,
@@ -11898,6 +11886,34 @@ const HeapSnapshot* HeapProfiler::TakeHeapSnapshot(ActivityControl* control,
   HeapSnapshotOptions options;
   options.control = control;
   options.global_object_name_resolver = resolver;
+  options.snapshot_mode = hide_internals ? HeapSnapshotMode::kRegular
+                                         : HeapSnapshotMode::kExposeInternals;
+  options.numerics_mode = capture_numeric_value
+                              ? NumericsMode::kExposeNumericValues
+                              : NumericsMode::kHideNumericValues;
+  return TakeHeapSnapshot(options);
+}
+
+const HeapSnapshot* HeapProfiler::TakeHeapSnapshot(
+    ActivityControl* control, ContextNameResolver* resolver,
+    bool hide_internals, bool capture_numeric_value) {
+  HeapSnapshotOptions options;
+  options.control = control;
+  options.context_name_resolver = resolver;
+  options.snapshot_mode = hide_internals ? HeapSnapshotMode::kRegular
+                                         : HeapSnapshotMode::kExposeInternals;
+  options.numerics_mode = capture_numeric_value
+                              ? NumericsMode::kExposeNumericValues
+                              : NumericsMode::kHideNumericValues;
+  return TakeHeapSnapshot(options);
+}
+
+const HeapSnapshot* HeapProfiler::TakeHeapSnapshot(ActivityControl* control,
+                                                   std::nullptr_t resolver,
+                                                   bool hide_internals,
+                                                   bool capture_numeric_value) {
+  HeapSnapshotOptions options;
+  options.control = control;
   options.snapshot_mode = hide_internals ? HeapSnapshotMode::kRegular
                                          : HeapSnapshotMode::kExposeInternals;
   options.numerics_mode = capture_numeric_value

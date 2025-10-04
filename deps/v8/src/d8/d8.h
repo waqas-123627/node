@@ -334,10 +334,11 @@ class PerIsolateData {
                            Local<Value> exception);
   int HandleUnhandledPromiseRejections();
 
-  // Keep track of DynamicImportData so we can properly free it on shutdown
-  // when LEAK_SANITIZER is active.
+  // Keep track of DynamicImportData so we can prevent leaks and unauthorized
+  // uses.
   void AddDynamicImportData(DynamicImportData*);
   void DeleteDynamicImportData(DynamicImportData*);
+  DynamicImportData* LookupImportData(void*);
 
   Local<FunctionTemplate> GetTestApiObjectCtor() const;
   void SetTestApiObjectCtor(Local<FunctionTemplate> ctor);
@@ -367,9 +368,7 @@ class PerIsolateData {
   std::vector<std::tuple<Global<Promise>, Global<Message>, Global<Value>>>
       unhandled_promises_;
   AsyncHooks* async_hooks_wrapper_;
-#if defined(LEAK_SANITIZER)
   std::unordered_set<DynamicImportData*> import_data_;
-#endif
   Global<FunctionTemplate> test_api_object_ctor_;
   Global<FunctionTemplate> dom_node_ctor_;
   // Track workers and their callbacks separately, so that we know both which
@@ -613,7 +612,6 @@ class Shell : public i::AllStatic {
 
   static void InstallConditionalFeatures(
       const v8::FunctionCallbackInfo<v8::Value>& info);
-  static void EnableJSPI(const v8::FunctionCallbackInfo<v8::Value>& info);
   static void SetFlushDenormals(
       const v8::FunctionCallbackInfo<v8::Value>& info);
 
@@ -892,6 +890,20 @@ class Shell : public i::AllStatic {
   static std::map<std::string, std::unique_ptr<ScriptCompiler::CachedData>>
       cached_code_map_;
   static std::atomic<int> unhandled_promise_rejections_;
+
+#if V8_ENABLE_WEBASSEMBLY
+  // The `d8.wasm.serializeModule` and `d8.wasm.deserializeModule` APIs are
+  // constrained to only allow deserializing bytes that were previously produced
+  // via serialization. This is how embedders will use the API as well, and
+  // deserialization can not safely handle manipulated bytes.
+  // This check prevents fuzzers from creating all kinds of crashes by
+  // manipulating serialized bytes.
+  // Note that this is prone to hash collisions; if we get occasional (maybe
+  // external) reports here, this is fine. It's not a vulnerability.
+  static base::LazyMutex wasm_serialized_bytes_mutex_;
+  // Stores a hash of concatenated wire bytes plus serialized bytes.
+  static std::unordered_set<size_t> wasm_serialized_bytes_hashes_;
+#endif  // V8_ENABLE_WEBASSEMBLY
 };
 
 class FuzzerMonitor : public i::AllStatic {

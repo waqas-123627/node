@@ -20,6 +20,7 @@
 #include "src/api/api-inl.h"
 #include "src/base/macros.h"
 #include "src/base/utils/random-number-generator.h"
+#include "src/flags/save-flags.h"
 #include "src/handles/handles.h"
 #include "src/heap/parked-scope.h"
 #include "src/logging/log.h"
@@ -64,6 +65,14 @@ template <typename TMixin>
 class WithJSSharedMemoryFeatureFlagsMixin : public TMixin {
  public:
   WithJSSharedMemoryFeatureFlagsMixin() { i::v8_flags.harmony_struct = true; }
+};
+
+template <typename TMixin>
+class WithShadowRealmFeatureFlagsMixin : public TMixin {
+ public:
+  WithShadowRealmFeatureFlagsMixin() {
+    i::v8_flags.harmony_shadow_realm = true;
+  }
 };
 
 using CounterMap = std::map<std::string, int>;
@@ -322,7 +331,8 @@ using TestWithContext =                    //
                     ::testing::Test>>>>;
 
 // Use v8::internal::TestJSSharedMemoryWithNativeContext if you are testing
-// internals, aka. directly work with Handles.
+// internals, aka. directly work with Handles and require --harmony-struct
+// feature.
 //
 // Using this will FATAL when !V8_CAN_CREATE_SHARED_HEAP_BOOL
 using TestJSSharedMemoryWithContext =                     //
@@ -331,6 +341,17 @@ using TestJSSharedMemoryWithContext =                     //
             WithIsolateMixin<                             //
                 WithDefaultPlatformMixin<                 //
                     WithJSSharedMemoryFeatureFlagsMixin<  //
+                        ::testing::Test>>>>>;
+
+// Use v8::internal::TestShadowRealmWithContext if you are testing
+// internals, aka. directly work with Handles and require
+// --harmony-shadow-realm feature.
+using TestShadowRealmWithContext =                     //
+    WithContextMixin<                                  //
+        WithIsolateScopeMixin<                         //
+            WithIsolateMixin<                          //
+                WithDefaultPlatformMixin<              //
+                    WithShadowRealmFeatureFlagsMixin<  //
                         ::testing::Test>>>>>;
 
 class PrintExtension : public v8::Extension {
@@ -518,19 +539,6 @@ using TestJSSharedMemoryWithNativeContext =  //
             WithIsolateScopeMixin<           //
                 WithIsolateMixin<            //
                     TestJSSharedMemoryWithPlatform>>>>;
-
-class V8_NODISCARD SaveFlags {
- public:
-  SaveFlags();
-  ~SaveFlags();
-  SaveFlags(const SaveFlags&) = delete;
-  SaveFlags& operator=(const SaveFlags&) = delete;
-
- private:
-#define FLAG_MODE_APPLY(ftype, ctype, nam, def, cmt) ctype SAVED_##nam;
-#include "src/flags/flag-definitions.h"
-#undef FLAG_MODE_APPLY
-};
 
 // For GTest.
 inline void PrintTo(Tagged<Object> o, ::std::ostream* os) {

@@ -1536,7 +1536,7 @@ struct ControlBase : public PcForErrors<ValidationTag::validate> {
     const Value& length)                                                       \
   F(I31GetS, const Value& input, Value* result)                                \
   F(I31GetU, const Value& input, Value* result)                                \
-  F(RefGetDesc, const Value& ref, Value* desc)                                 \
+  F(RefGetDesc, ModuleTypeIndex struct_index, const Value& ref, Value* desc)   \
   F(RefTest, HeapType target_type, const Value& obj, Value* result,            \
     bool null_succeeds)                                                        \
   F(RefTestAbstract, const Value& obj, HeapType type, Value* result,           \
@@ -4243,9 +4243,17 @@ class WasmFullDecoder : public WasmDecoder<ValidationTag, decoding_mode> {
     if (!this->ValidateFunction(this->pc_ + 1, imm)) return 0;
     ModuleTypeIndex index = this->module_->functions[imm.index].sig_index;
     const TypeDefinition& type_def = this->module_->type(index);
-    Value* value =
-        Push(ValueType::Ref(index, type_def.is_shared, RefTypeKind::kFunction)
-                 .AsExactIfEnabled(this->enabled_));
+    ValueType result_type =
+        ValueType::Ref(index, type_def.is_shared, RefTypeKind::kFunction);
+    // For imported functions, we must return an inexact type, because
+    // importing checks subtyping, i.e. for function types f1 <: f2, it is
+    // legal to provide a function with type f1 when one with type f2 is
+    // expected.
+    if (this->enabled_.has_custom_descriptors() &&
+        imm.index >= this->module_->num_imported_functions) {
+      result_type = result_type.AsExact();
+    }
+    Value* value = Push(result_type);
     CALL_INTERFACE_IF_OK_AND_REACHABLE(RefFunc, imm.index, value);
     return 1 + imm.length;
   }
@@ -4582,13 +4590,14 @@ class WasmFullDecoder : public WasmDecoder<ValidationTag, decoding_mode> {
   }
 
   V8_INLINE int DecodeEffectHandlerTable(
+      ContIndexImmediate cont_imm,
       EffectHandlerTableImmediate& handler_table_imm,
       base::Vector<HandlerCase>& handlers) {
-    EffectHandlerTableIterator<ValidationTag> handle_iterator(
+    EffectHandlerTableIterator<ValidationTag> handler_iterator(
         this, handler_table_imm);
     int i = 0;
-    while (handle_iterator.has_next()) {
-      HandlerCase handler = handle_iterator.next();
+    while (handler_iterator.has_next()) {
+      HandlerCase handler = handler_iterator.next();
 
       if (!this->Validate(this->pc_, handler.tag)) {
         return -1;
@@ -4598,17 +4607,69 @@ class WasmFullDecoder : public WasmDecoder<ValidationTag, decoding_mode> {
       uint32_t stack_size = stack_.size();
       uint32_t push_count = 0;
       if (handler.kind == kOnSuspend) {
-        const WasmTagSig* sig = handler.tag.tag->sig;
-        stack_.EnsureMoreCapacity(static_cast<int>(sig->parameter_count()),
-                                  this->zone_);
-        for (ValueType type : sig->parameters()) Push(type);
-        push_count += sig->parameter_count();
-
+        const WasmTagSig* tag_sig = handler.tag.tag->sig;
+        stack_.EnsureMoreCapacity(
+            static_cast<int>(tag_sig->parameter_count() + 1), this->zone_);
         if (!VALIDATE((this->Validate(this->pc_, handler.maybe_depth.br,
                                       control_depth())))) {
           return -1;
         }
         Control* target = control_at(handler.maybe_depth.br.depth);
+        int merge_arity = target->br_merge()->arity;
+        for (ValueType type : tag_sig->parameters()) Push(type);
+        push_count += tag_sig->parameter_count();
+
+        // The target block's last return type must be a continuation type
+        // index.
+        if (!VALIDATE(merge_arity > 0)) {
+          this->DecodeError(
+              "expected (ref null? cont) as last return type "
+              "of target block for handler %u"
+              ", no return type found",
+              handler_iterator.cur_index() - 1);
+          return -1;
+        }
+        Value& val = (*target->br_merge())[target->br_merge()->arity - 1];
+        ValueType type = val.type;
+        if (!VALIDATE(type.has_index() &&
+                      this->module_->has_cont_type(type.ref_index()))) {
+          this->DecodeError(
+              "expected (ref null? cont) as last return type "
+              "of target block for handler %u, got %s",
+              handler_iterator.cur_index() - 1, val.type.name().c_str());
+          return -1;
+        }
+        base::Vector<const ValueType> old_cont_returns =
+            this->module_->signature(cont_imm.cont_type->contfun_typeindex())
+                ->returns();
+        const ContType* cont_type = this->module_->cont_type(type.ref_index());
+        ModuleTypeIndex sig_index = cont_type->contfun_typeindex();
+        const FunctionSig* cont_sig = this->module_->signature(sig_index);
+
+        // The function type [t2*] -> [t*] must be a subtype of the continuation
+        // type, where t2* is the return type of the tag, and t* is the return
+        // type of the resumed continuation.
+        // This is contravariant in the parameters, so the continuation params
+        // should be a subtype of the tag returns t2*.
+        if (!VALIDATE(
+                IsSubtypeVec(cont_sig->parameters(), tag_sig->returns()))) {
+          this->DecodeError(
+              "Type mismatch between cont parameters and tag returns for "
+              "handler %u",
+              handler_iterator.cur_index() - 1);
+          return -1;
+        }
+        // And the old returns should be a subtype of the new ones.
+        if (!VALIDATE(IsSubtypeVec(old_cont_returns, cont_sig->returns()))) {
+          this->DecodeError(
+              "Type mismatch between old and new cont returns for handler %u",
+              handler_iterator.cur_index() - 1);
+          return -1;
+        }
+        Push(type);
+        push_count += 1;
+
+        // Finally, type check the branch itself.
         if (!VALIDATE(push_count == target->br_merge()->arity)) {
           this->DecodeError(
               "handler generates %d operand%s, target block returns %d",
@@ -4629,7 +4690,7 @@ class WasmFullDecoder : public WasmDecoder<ValidationTag, decoding_mode> {
       }
       i++;
     }
-    return handle_iterator.length();
+    return handler_iterator.length();
   }
 
   DECODE(Resume) {
@@ -4648,7 +4709,8 @@ class WasmFullDecoder : public WasmDecoder<ValidationTag, decoding_mode> {
         this->zone_->template AllocateVector<HandlerCase>(
             handler_table_imm.table_count);
 
-    int table_length = DecodeEffectHandlerTable(handler_table_imm, handlers);
+    int table_length =
+        DecodeEffectHandlerTable(imm, handler_table_imm, handlers);
     if (table_length < 0) return 0;
 
     // Continuations are function-like values; check the args and returns.
@@ -4687,7 +4749,8 @@ class WasmFullDecoder : public WasmDecoder<ValidationTag, decoding_mode> {
         this->zone_->template AllocateVector<HandlerCase>(
             handler_table_imm.table_count);
 
-    int table_length = DecodeEffectHandlerTable(handler_table_imm, handlers);
+    int table_length =
+        DecodeEffectHandlerTable(cont_imm, handler_table_imm, handlers);
     if (table_length < 0) return 0;
 
     // The continuation might return, check the return type.
@@ -6007,10 +6070,28 @@ class WasmFullDecoder : public WasmDecoder<ValidationTag, decoding_mode> {
           return 0;
         }
         Value ref = Pop(ValueType::RefNull(imm.heap_type()));
+        // "none" and "bottom" are subtypes of "exact $t", and to maintain
+        // subsumption, the result must not be less specific when the input is
+        // more specific, so here we must treat them both as if they were exact.
+        // See example at:
+        // https://github.com/WebAssembly/custom-descriptors/issues/48
+        Exactness result_exactness = ref.type.exactness();
+        if (ref.type == kWasmNullRef || ref.type == kWasmRefNone ||
+            ref.type == kWasmBottom) {
+          result_exactness = kExact;
+        } else {
+          // All other generic types would have failed validation above.
+          DCHECK(ref.type.has_index());
+          // Exactness is only propagated if the actual type on the stack
+          // exactly matched the type immediate.
+          if (ref.type.ref_index() != imm.index) {
+            result_exactness = kAnySubtype;
+          }
+        }
         Value* desc =
             Push(ValueType::Ref(this->module_->heap_type(type.descriptor))
-                     .AsExact(ref.type.exactness()));
-        CALL_INTERFACE_IF_OK_AND_REACHABLE(RefGetDesc, ref, desc);
+                     .AsExact(result_exactness));
+        CALL_INTERFACE_IF_OK_AND_REACHABLE(RefGetDesc, imm.index, ref, desc);
         return opcode_length + imm.length;
       }
       case kExprRefCastDesc:
